@@ -17,34 +17,6 @@ Based on: Christiano et al., *Deep Reinforcement Learning from Human Preferences
 
 ---
 
-## Architecture
-
-```
-HalfCheetah-v5 (MuJoCo)
-        |
-        v
-  collect_trajectory()          env_setup.py
-        |
-        v
-  extract_features()            env_setup.py
-  features_to_text()
-        |
-        v
-  GPT-4o-mini pairwise label    llm_labeler.py  (PLANNED)
-  (Bradley-Terry comparison)
-        |
-        v
-  Ensemble Reward Model R_phi   reward_model.py (PLANNED)
-        |
-        v
-  Full Reward:                  train.py        (PLANNED)
-  r_t = r_fixed(t) + g(s,a,s') * R_phi(s,a,s')
-        |
-        v
-  Policy Optimization (PPO/SAC)
-```
-
----
 
 ## Reward Formulation
 
