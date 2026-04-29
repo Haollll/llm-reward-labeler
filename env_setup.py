@@ -1,7 +1,15 @@
 import gymnasium as gym
 import numpy as np
+import torch
 from dataclasses import dataclass
 from typing import List, Tuple
+
+if torch.cuda.is_available():
+    DEVICE = 'cuda'
+elif torch.backends.mps.is_available():
+    DEVICE = 'mps'
+else:
+    DEVICE = 'cpu'
 
 # ─────────────────────────────────────────
 # HalfCheetah Observation Space (17 dims)
