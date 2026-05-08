@@ -1,0 +1,1 @@
+Make the HalfCheetah robot run to the right as fast as possible, with smooth actions, low energy use, and stable body posture.
