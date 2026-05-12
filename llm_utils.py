@@ -110,6 +110,13 @@ def _generate_code(
     return code, _exec_fn(code, fn_name)
 
 
+def cache_key(env: gym.Env, task: str) -> str:
+    """Hex cache key identifying an (env, task) pair. Matches the LLM cache filenames."""
+    env_id = describe_env(env)["env_id"]
+    safe_id = env_id.replace("/", "_")
+    return f"{safe_id}_{_hash_task(env_id, task)}"
+
+
 def generate_reward_fn(
     env: gym.Env,
     task_description: str,

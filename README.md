@@ -12,7 +12,7 @@ Standard RLHF requires human annotators to compare trajectory pairs and label pr
 2. **LLM-generated semantic layer** — an LLM writes a function that translates raw trajectories (states, actions) into natural language descriptions
 3. **LLM preference labeler** — an LLM compares pairs of trajectory descriptions and returns a preference label, replacing human annotators
 4. **Bradley-Terry ensemble reward model** — a learned reward model `R_phi` (ensemble of 3 networks) is trained on these LLM-generated labels
-5. **Combined reward signal** — `r_total = r_fixed + g * normalise(R_phi)`, where `g` is a scalar gain
+5. **Combined reward signal** — `r_total = alpha * r_fixed + (1 - alpha) * g * normalise(R_phi)`, where `alpha` decays across training rounds
 6. **Active learning** — candidate trajectories are ranked by ensemble disagreement; only the most informative pairs are queried, maximizing label efficiency
 
 The agent is PPO on `HalfCheetah-v5`. An `--oracle` flag replaces the LLM labeler with ground-truth reward sums for ablation comparison.
@@ -24,6 +24,7 @@ The agent is PPO on `HalfCheetah-v5`. An `--oracle` flag replaces the LLM labele
 ```
 .
 ├── train.py              # Entry point, argparse
+├── evaluate.py           # Load saved policy/reward model, render, plot rewards
 ├── trainer.py            # Trainer, TrainerConfig, main training loop
 ├── ppo_agent.py          # PPOAgent wrapping stable-baselines3 PPO
 ├── sampler.py            # Trajectory collection, oracle/LLM labelling, active learning
@@ -70,6 +71,9 @@ python train.py --oracle --rounds 3 --queries 5 --ppo-steps 5000
 # Full run with LLM as preference labeler
 python train.py --rounds 9 --queries 10 --ppo-steps 50000
 
+# Evaluate saved artifacts, render the scene, and save reward trace plot
+python evaluate.py
+
 # Test env setup + LLM code generation
 python env_setup.py
 ```
@@ -96,11 +100,12 @@ python env_setup.py
 ## Reward Formulation
 
 ```
-r_total = r_fixed(s, a, s') + g * normalise(R_phi(s, a, s'))
+r_total = alpha * r_fixed(s, a, s') + (1 - alpha) * g * normalise(R_phi(s, a))
 ```
 
 - `r_fixed` — LLM-generated fixed reward function derived from env source code
 - `R_phi` — ensemble reward model trained on LLM preference labels
+- `alpha` — linearly decays from 1.0 across training rounds, shifting from fixed reward toward learned reward
 - `g` — scalar gain controlling the learned reward's contribution
 - `normalise` — running z-score normalization of `R_phi` outputs
 

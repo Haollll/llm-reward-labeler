@@ -1,10 +1,11 @@
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import gymnasium as gym
 
 from helper import load_task, section
-from llm_utils import generate_reward_fn, generate_semantic_fn
+from llm_utils import cache_key, generate_reward_fn, generate_semantic_fn
 from reward_model import RewardModel
 from ppo_agent import PPOAgent
 from sampler import Sampler
@@ -19,6 +20,9 @@ class TrainerConfig:
     reward_epochs: int      = 50        # reward model training epochs per round
     ppo_steps: int          = 20_000    # PPO timesteps per round
     eval_every: int         = 2         # evaluate every N rounds
+    rounds: int             = 9
+    artifact_dir: str       = "artifacts"
+    progress_bar: bool      = True
     llm_model: str          = "gpt-4o-mini"
     verbose: bool           = True
 
@@ -48,6 +52,7 @@ class Trainer:
 
         _, self.reward_fn   = generate_reward_fn(_probe_env, self.task, model=cfg.llm_model)
         _, self.semantic_fn = generate_semantic_fn(_probe_env, self.task, model=cfg.llm_model)
+        self.cache_id = cache_key(_probe_env, self.task)
         _probe_env.close()
 
         if cfg.verbose:
@@ -56,8 +61,7 @@ class Trainer:
         # ── reward model ────────────────────────────────────
         _env = gym.make(cfg.env_id)
         self.reward_model = RewardModel(
-            obs_dim       = _env.observation_space.shape[0],
-            action_dim    = _env.action_space.shape[0],
+            env           = _env,
             size_segment  = cfg.segment_length,
         )
         _env.close()
@@ -67,6 +71,8 @@ class Trainer:
             env_id        = cfg.env_id,
             reward_fn     = self.reward_fn,
             reward_model  = self.reward_model,
+            cache_key     = self.cache_id,
+            progress_bar  = cfg.progress_bar,
             verbose       = 0,
         )
 
@@ -89,6 +95,7 @@ class Trainer:
         self.eval_rewards:     list[float] = []
         self.reward_losses:    list[float] = []
         self.label_accuracies: list[float] = []
+        self.artifact_root = Path(cfg.artifact_dir)
 
     # ── public ───────────────────────────────────────────────
 
@@ -104,7 +111,8 @@ class Trainer:
             if self.cfg.verbose:
                 print(section(f"Round {rnd}/{n_rounds}"))
 
-            self._ppo_step()
+            alpha = self._alpha_for_round(rnd, n_rounds)
+            self._ppo_step(alpha)
             self._label_step(use_active=True)
             loss = self._reward_model_step()
 
@@ -112,6 +120,7 @@ class Trainer:
                 self._eval_step(rnd, loss)
 
         self._print_summary()
+        self._save_artifacts()
 
     # ── private: training steps ──────────────────────────────
 
@@ -122,10 +131,18 @@ class Trainer:
         self._label_step(use_active=False)
         self._reward_model_step()
 
-    def _ppo_step(self) -> None:
+    def _alpha_for_round(self, rnd: int, n_rounds: int) -> float:
+        if n_rounds <= 1:
+            return 1.0
+        return 1.0 - ((rnd - 1) / (n_rounds - 1))
+
+    def _ppo_step(self, alpha: float) -> None:
         if self.cfg.verbose:
-            print(f"  PPO ({self.cfg.ppo_steps} steps)...")
+            print(f"  Training PPO policy | steps {self.cfg.ppo_steps} | alpha {alpha:.3f}")
+        self.agent.set_alpha(alpha)
         self.agent.train(total_timesteps=self.cfg.ppo_steps)
+        if self.cfg.verbose:
+            print("  PPO policy training complete")
 
     def _label_step(self, use_active: bool) -> None:
         added = self.sampler.collect_and_label(
@@ -136,9 +153,16 @@ class Trainer:
             print(f"  Labels added: {added} | buffer: {len(self.reward_model.buffer)}")
 
     def _reward_model_step(self) -> float:
+        batch_size = min(64, len(self.reward_model.buffer))
+        if self.cfg.verbose:
+            print(
+                f"  Training reward model | epochs {self.cfg.reward_epochs} "
+                f"| batch {batch_size} | labels {len(self.reward_model.buffer)}"
+            )
         loss = self.reward_model.train(
-            batch_size=min(64, len(self.reward_model.buffer)),
+            batch_size=batch_size,
             n_epochs=self.cfg.reward_epochs,
+            progress_bar=self.cfg.progress_bar,
         )
         acc = self.reward_model.accuracy()
         self.reward_losses.append(loss)
@@ -171,3 +195,17 @@ class Trainer:
         if self.label_accuracies:
             print(f"  LLM accuracy  : {self.label_accuracies[-1]:.1%}")
         print(f"  Total labels  : {len(self.reward_model.buffer)}")
+
+    def _save_artifacts(self) -> None:
+        reward_dir = self.artifact_root / "reward_models" / self.cache_id
+        policy_dir = self.artifact_root / "policies" / self.cache_id
+        reward_dir.mkdir(parents=True, exist_ok=True)
+        policy_dir.mkdir(parents=True, exist_ok=True)
+
+        self.reward_model.save(str(reward_dir))
+        self.agent.save(str(policy_dir / "policy"))
+
+        if self.cfg.verbose:
+            print(section("Artifacts"))
+            print(f"  Reward model: {reward_dir}")
+            print(f"  Policy      : {policy_dir / 'policy.zip'}")

@@ -3,7 +3,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from typing import List, Optional, Tuple
+from pathlib import Path
+from typing import Any, List, Optional, Tuple
+
+from llm_utils import describe_env
 
 DEVICE = (
     "cuda" if torch.cuda.is_available() else
@@ -18,6 +21,17 @@ def _build_net(in_size: int, hidden: int = 256) -> nn.Sequential:
         nn.Linear(hidden, hidden),  nn.LeakyReLU(0.01),
         nn.Linear(hidden, 1),       nn.Tanh(),
     )
+
+
+def _space_dim(space_desc: dict) -> int:
+    if "shape" in space_desc:
+        dim = 1
+        for size in space_desc["shape"]:
+            dim *= int(size)
+        return dim
+    if "n" in space_desc:
+        return int(space_desc["n"])
+    raise ValueError(f"Unsupported space description: {space_desc}")
 
 
 class PreferenceBuffer:
@@ -53,24 +67,31 @@ class RewardModel:
     Ensemble reward model trained with Bradley-Terry loss.
 
     Quick usage:
-        model = RewardModel(obs_dim=17, action_dim=6)
+        env = gym.make("HalfCheetah-v5")
+        model = RewardModel(env)
         model.add(seg_A, seg_B, label=1.0)   # from compare_trajectories()
         loss = model.train()
         r    = model.predict(obs, action)     # for RewardWrappedEnv
     """
     def __init__(
         self,
-        obs_dim: int       = 17,
-        action_dim: int    = 6,
+        env: Any,
         ensemble_size: int = 3,
         hidden: int        = 256,
         lr: float          = 3e-4,
         size_segment: int  = 50,
         capacity: int      = 5000,
     ):
+        env_desc = describe_env(env)
+        obs_dim = _space_dim(env_desc["observation_space"])
+        action_dim = _space_dim(env_desc["action_space"])
+
+        self.obs_dim       = obs_dim
+        self.action_dim    = action_dim
         self.sa_dim        = obs_dim + action_dim
         self.ensemble_size = ensemble_size
         self.size_segment  = size_segment
+        self.hidden        = hidden
 
         self.nets = [
             _build_net(self.sa_dim, hidden).float().to(DEVICE)
@@ -90,11 +111,21 @@ class RewardModel:
         """seg: (B, T, sa_dim) → (B, 1)"""
         return self.nets[member](torch.FloatTensor(seg).to(DEVICE)).sum(axis=1)
 
-    def train(self, batch_size: int = 64, n_epochs: int = 50) -> float:
+    def train(
+        self,
+        batch_size: int = 64,
+        n_epochs: int = 50,
+        progress_bar: bool = False,
+    ) -> float:
         if len(self.buffer) < batch_size:
             return 0.0
         total = 0.0
-        for _ in range(n_epochs):
+        epochs = range(n_epochs)
+        if progress_bar:
+            from tqdm.auto import tqdm
+            epochs = tqdm(epochs, desc="Reward model", leave=False)
+
+        for _ in epochs:
             seg1, seg2, labels = self.buffer.sample(batch_size)
             target = torch.from_numpy(
                 (1 - labels.flatten()).astype(np.int64)
@@ -158,12 +189,26 @@ class RewardModel:
         return float(np.mean(accs))
 
     def save(self, path: str):
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
         for i, net in enumerate(self.nets):
-            torch.save(net.state_dict(), f"{path}_member{i}.pt")
+            torch.save(net.state_dict(), path / f"member{i}.pt")
+        torch.save(
+            {
+                "obs_dim": self.obs_dim,
+                "action_dim": self.action_dim,
+                "sa_dim": self.sa_dim,
+                "ensemble_size": self.ensemble_size,
+                "size_segment": self.size_segment,
+                "hidden": self.hidden,
+            },
+            path / "metadata.pt",
+        )
 
     def load(self, path: str):
+        path = Path(path)
         for i, net in enumerate(self.nets):
-            net.load_state_dict(torch.load(f"{path}_member{i}.pt"))
+            net.load_state_dict(torch.load(path / f"member{i}.pt", map_location=DEVICE))
 
 
 def traj_to_segment(
@@ -185,8 +230,11 @@ def traj_to_segment(
 
 
 if __name__ == "__main__":
+    import gymnasium as gym
+
     print(f"Device: {DEVICE}")
-    model = RewardModel(obs_dim=17, action_dim=6)
+    env = gym.make("HalfCheetah-v5")
+    model = RewardModel(env)
     for _ in range(80):
         s1 = np.random.randn(50, 23).astype(np.float32)
         s2 = np.random.randn(50, 23).astype(np.float32)
@@ -195,3 +243,4 @@ if __name__ == "__main__":
     print(f"loss={loss:.4f} | acc={model.accuracy():.2%} | buffer={len(model.buffer)}")
     r = model.predict(np.random.randn(17), np.random.randn(6))
     print(f"predicted reward: {r:.4f}")
+    env.close()
