@@ -9,6 +9,7 @@ from llm_utils import cache_key, generate_reward_fn, generate_semantic_fn
 from reward_model import RewardModel
 from ppo_agent import PPOAgent
 from sampler import Sampler
+from llm_reflection import ReflectionEngine
 
 @dataclass
 class TrainerConfig:
@@ -50,8 +51,8 @@ class Trainer:
         if cfg.verbose:
             print(section("Generating reward fn + semantic layer"))
 
-        _, self.reward_fn   = generate_reward_fn(_probe_env, self.task, model=cfg.llm_model)
-        _, self.semantic_fn = generate_semantic_fn(_probe_env, self.task, model=cfg.llm_model)
+        reward_code, self.reward_fn   = generate_reward_fn(_probe_env, self.task, model=cfg.llm_model)
+        semantic_code, self.semantic_fn = generate_semantic_fn(_probe_env, self.task, model=cfg.llm_model)
         self.cache_id = cache_key(_probe_env, self.task)
         _probe_env.close()
 
@@ -90,7 +91,19 @@ class Trainer:
             llm_model      = cfg.llm_model,
             verbose        = cfg.verbose,
         )
-
+        self.reflection: Optional[ReflectionEngine] = None
+        
+        if not cfg.use_oracle:
+            composite = self.agent._train_env.envs[0]._reward_fn
+            self.reflection = ReflectionEngine(
+                task             = self.task,
+                reward_code      = reward_code,
+                semantic_code    = semantic_code,
+                composite_reward = composite,
+                sampler          = self.sampler,
+                llm_model        = cfg.llm_model,
+                verbose          = cfg.verbose,
+            )
         # ── logging ──────────────────────────────────────────
         self.eval_rewards:     list[float] = []
         self.reward_losses:    list[float] = []
@@ -184,6 +197,9 @@ class Trainer:
         if self.cfg.verbose:
             print(f"  LLM label accuracy: {acc:.1%}")
 
+        if self.reflection is not None:
+            self.reflection.step(rnd, mean_r, loss, acc, len(self.reward_model.buffer))
+            
     # ── private: summary ─────────────────────────────────────
 
     def _print_summary(self) -> None:

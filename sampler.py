@@ -1,4 +1,4 @@
-from typing import Callable, List, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 
@@ -29,14 +29,12 @@ class Sampler:
     Collects trajectory pairs and obtains preference labels.
 
     Two query strategies:
-      uniform    — random pairs (used during cold start when the reward
-                   model has not yet been trained)
-      active     — disagreement sampling: collect CANDIDATE_RATIO × n
-                   candidates, ask the reward-model ensemble which pairs
-                   it disagrees about most, and query only those
+      uniform — random pairs (used during cold start)
+      active  — disagreement sampling: collect CANDIDATE_RATIO × n
+                candidates, query only the most informative pairs
     """
 
-    CANDIDATE_RATIO = 5   # candidates per query when use_active=True
+    CANDIDATE_RATIO = 5
 
     def __init__(
         self,
@@ -59,6 +57,9 @@ class Sampler:
         self.use_oracle     = use_oracle
         self.llm_model      = llm_model
         self.verbose        = verbose
+
+        # set by ReflectionEngine (Option C) to steer LLM comparisons
+        self.comparison_guidance: str = ""
 
     # ── public ───────────────────────────────────────────────
 
@@ -125,16 +126,28 @@ class Sampler:
     ) -> Tuple[np.ndarray, np.ndarray, List[Trajectory], List[Trajectory]]:
         scores = self.reward_model.disagreement(segs_a, segs_b)
         top_k  = (-scores).argsort()[:n]
-        return segs_a[top_k], segs_b[top_k], [trajs_a[i] for i in top_k], [trajs_b[i] for i in top_k]
+        return (
+            segs_a[top_k],
+            segs_b[top_k],
+            [trajs_a[i] for i in top_k],
+            [trajs_b[i] for i in top_k],
+        )
 
     def _query_label(self, traj_a: Trajectory, traj_b: Trajectory) -> int:
         if self.use_oracle:
             return oracle_label(traj_a, traj_b)
 
+        # append comparison_guidance to task description if set by ReflectionEngine
+        task_with_guidance = (
+            f"{self.task}\n\nAdditional guidance: {self.comparison_guidance}"
+            if self.comparison_guidance
+            else self.task
+        )
+
         label, explanation = compare_trajectories(
             traj_a, traj_b,
             semantic_fn=self.semantic_fn,
-            task_description=self.task,
+            task_description=task_with_guidance,
             model=self.llm_model,
         )
         if self.verbose:

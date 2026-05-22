@@ -5,14 +5,6 @@ import numpy as np
 
 
 class CompositeReward:
-    """Composes alpha * r_fixed + (1 - alpha) * g * normalize(R_phi).
-
-    alpha starts at 1.0 so PPO trains only on r_fixed. As alpha decays,
-    the learned reward model contributes more of the training signal.
-
-    Identified by `cache_key` (env_id + task hash) so different (env, task) pairs
-    can be tracked and saved separately.
-    """
 
     def __init__(
         self,
@@ -33,15 +25,24 @@ class CompositeReward:
         self.alpha = float(np.clip(alpha, 0.0, 1.0))
 
     def __call__(self, obs, action, next_obs) -> float:
-        r_fix = float(self.r_fixed(obs, action, next_obs))
+        raw = self.r_fixed(obs, action, next_obs)
 
+        # handle dict (EUREKA-style) or plain float
+        if isinstance(raw, dict):
+            self.last_components = {k: float(v) for k, v in raw.items()}
+            r_fix = self.last_components.get("total", 0.0)
+        else:
+            r_fix = float(raw)
+            self.last_components = {"total": r_fix}
+ 
         if self.reward_model is None:
             return r_fix
-
+ 
         r_phi = float(self.reward_model.predict(obs, action))
         self._recent_abs.append(abs(r_phi))
-        std = float(np.std(self._recent_abs)) if len(self._recent_abs) > 10 else 1.0
+        std        = float(np.std(self._recent_abs)) if len(self._recent_abs) > 10 else 1.0
         r_phi_norm = r_phi / (std + 1e-8)
-
+ 
         gate = float(self.g(obs, action, next_obs))
         return self.alpha * r_fix + (1.0 - self.alpha) * gate * r_phi_norm
+ 
