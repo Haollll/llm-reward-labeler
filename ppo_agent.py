@@ -65,6 +65,10 @@ class PPOAgent:
         action, _ = self._model.predict(obs, deterministic=False)
         return action
 
+    def predict_deterministic(self, obs: np.ndarray) -> np.ndarray:
+        action, _ = self._model.predict(obs, deterministic=True)
+        return action
+
     def evaluate(self, n_episodes: int = 5) -> float:
         rewards = []
         eval_env = gym.make(self._env_id)

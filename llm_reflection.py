@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
+import numpy as np
 from openai import OpenAI
+
 from llm_utils import _exec_fn, _load_prompt, CACHE_DIR
 
 client = OpenAI()
@@ -13,63 +15,77 @@ client = OpenAI()
 # ── data ─────────────────────────────────────────────────────
 
 @dataclass
-class EvalStats:
-    rnd:        int
-    reward:     float
-    loss:       float
-    acc:        float
-    n_labels:   int
-    components: Dict[str, float] = field(default_factory=dict)
+class RoundSnapshot:
+    """One per round, post-PPO. Records what the policy looks like *now*."""
+    rnd:                int
+    component_means:    Dict[str, float]      # mean over eval episodes of per-trajectory component sums
+    episode_length:     float                 # mean episode length over eval episodes
+    episode_env_reward: float                 # mean per-episode env reward over eval episodes
+    success_rate:       Optional[float]       # mean over eval episodes, None if env never reports is_success
+    loss:               float
+    n_labels:           int
 
 
-# ── prompt ───────────────────────────────────────────────────
+# ── status formatting ─────────────────────────────────────────
 
-def _build_prompt(status: str, reward_code: str, semantic_code: str, task: str) -> str:
+def _format_series(name: str, vals: List[float], fmt: str) -> str:
+    quoted = ", ".join(f"'{v:{fmt}}'" for v in vals)
+    mx = max(vals)
+    mn = min(vals)
+    mu = sum(vals) / len(vals)
+    return f"{name}: [{quoted}], Max: {mx:{fmt}}, Mean: {mu:{fmt}}, Min: {mn:{fmt}}"
+
+
+def _format_training_history(snapshots: List[RoundSnapshot]) -> str:
+    if not snapshots:
+        return "No training data yet."
+
+    lines: List[str] = []
+
+    # per-component series — sorted name for stable ordering
+    all_comps: set = set()
+    for s in snapshots:
+        all_comps.update(s.component_means.keys())
+    for comp in sorted(all_comps):
+        vals = [s.component_means.get(comp, 0.0) for s in snapshots]
+        lines.append(_format_series(comp, vals, ".3f"))
+
+    # success rate — only if at least one snapshot reported a non-None value
+    success_vals = [s.success_rate for s in snapshots if s.success_rate is not None]
+    if success_vals:
+        # backfill missing entries with 0.0 to keep alignment with the round index
+        aligned = [s.success_rate if s.success_rate is not None else 0.0 for s in snapshots]
+        lines.append(_format_series("success_rate", aligned, ".3f"))
+
+    # episode length and episode env reward — always reported
+    lines.append(_format_series(
+        "episode_length", [s.episode_length for s in snapshots], ".1f",
+    ))
+    lines.append(_format_series(
+        "episode_env_reward", [s.episode_env_reward for s in snapshots], ".2f",
+    ))
+
+    return "\n".join(lines)
+
+
+# ── prompt assembly ───────────────────────────────────────────
+
+def _build_prompt(task: str, reward_code: str, semantic_code: str, training_summary: str) -> str:
     return _load_prompt("reflection").format(
-        status        = status,
-        reward_code   = reward_code,
-        semantic_code = semantic_code,
-        task          = task,
+        task             = task,
+        reward_code      = reward_code,
+        semantic_code    = semantic_code,
+        training_summary = training_summary,
     )
-
-
-def _status(history: List[EvalStats]) -> str:
-    if not history:
-        return "No data yet."
-    s = history[-1]
-
-    lines = [
-        f"Round {s.rnd} | reward {s.reward:.1f} | loss {s.loss:.4f} "
-        f"| acc {s.acc:.1%} | labels {s.n_labels}",
-    ]
-
-    # component breakdown — helps LLM diagnose which part of r_fixed is wrong
-    if s.components:
-        non_total = {k: v for k, v in s.components.items() if k != "total"}
-        if non_total:
-            breakdown = " | ".join(f"{k} {v:+.2f}" for k, v in non_total.items())
-            lines.append(f"Components: {breakdown}")
-
-    if len(history) >= 2:
-        delta = s.reward - history[-2].reward
-        lines.append(f"Δ reward {'+' if delta >= 0 else ''}{delta:.1f}")
-
-    if len(history) >= 2:
-        recent = [h.reward for h in history[-5:]]
-        delta  = recent[-1] - recent[0]
-        trend  = "improving" if delta > 50 else "declining" if delta < -50 else "plateauing"
-        lines.append(f"Trend: {trend}")
-
-    return " | ".join(lines)
 
 
 # ── engine ───────────────────────────────────────────────────
 
 class ReflectionEngine:
     """
-    Thin coordinator: tracks stats, decides when to reflect, applies result.
-    All LLM logic is in _reflect().
-    All apply logic is in _apply().
+    EUREKA-style reflection: after each round, summarise the training dynamics
+    (per-component values + global metrics across rounds) and let the LLM
+    rewrite both `r_fixed` and `summarize` based on that feedback.
     """
 
     def __init__(
@@ -79,63 +95,77 @@ class ReflectionEngine:
         semantic_code: str,
         composite_reward,
         sampler,
-        reflect_every: int        = 3,
-        acc_threshold: float      = 0.70,
-        plateau_rounds: int       = 3,
-        llm_model: str            = "gpt-4o",
-        verbose: bool             = True,
+        reward_model = None,
+        reflect_every: int = 1,
+        llm_model:    str  = "gpt-4o",
+        verbose:      bool = True,
     ):
-        self.task             = task
-        self.reward_code      = reward_code
-        self.semantic_code    = semantic_code
-        self.composite        = composite_reward
-        self.sampler          = sampler
-        self.reflect_every    = reflect_every
-        self.acc_threshold    = acc_threshold
-        self.plateau_rounds   = plateau_rounds
-        self.llm_model        = llm_model
-        self.verbose          = verbose
+        self.task           = task
+        self.reward_code    = reward_code
+        self.semantic_code  = semantic_code
+        self.composite      = composite_reward
+        self.sampler        = sampler
+        self.reward_model   = reward_model
+        self.reflect_every  = reflect_every
+        self.llm_model      = llm_model
+        self.verbose        = verbose
 
-        self._history: List[EvalStats] = []
-        self._plateau: int             = 0
-        self._n_evals: int             = 0
-        self.log:      list            = []
+        self.snapshots: List[RoundSnapshot] = []
+        self.log:       List[dict]          = []
+        self._n_evals:  int                 = 0
 
     # ── public ───────────────────────────────────────────────
 
     def step(
         self,
         rnd: int,
-        reward: float,
+        eval_data: Dict[str, Any],
         loss: float,
-        acc: float,
         n_labels: int,
     ) -> Optional[dict]:
-        """Record stats and reflect if any trigger fires."""
-        components = dict(getattr(self.composite, "last_components", {}))
-        self._history.append(EvalStats(rnd, reward, loss, acc, n_labels, components))
+        """Record a snapshot from this round's eval and reflect if due."""
+        snap = self._build_snapshot(rnd, eval_data, loss, n_labels)
+        self.snapshots.append(snap)
         self._n_evals += 1
 
-        if len(self._history) >= 2:
-            trend = _status(self._history).split("Trend: ")[-1]
-            self._plateau = self._plateau + 1 if trend == "plateauing" else 0
+        if self.verbose:
+            sr = f"{snap.success_rate:.2%}" if snap.success_rate is not None else "n/a"
+            print(
+                f"  Snapshot | env_reward {snap.episode_env_reward:+.1f} | "
+                f"length {snap.episode_length:.0f} | success {sr}"
+            )
 
-        if self._should_reflect(acc):
+        if self._n_evals % self.reflect_every == 0:
             return self._reflect()
         return None
 
-    # ── private: trigger ─────────────────────────────────────
+    # ── private: snapshot ────────────────────────────────────
 
-    def _should_reflect(self, acc: float) -> bool:
-        if not self._history:
-            return False
-        if acc < self.acc_threshold:
-            return True
-        if self._plateau >= self.plateau_rounds:
-            return True
-        if self._n_evals % self.reflect_every == 0:
-            return True
-        return False
+    def _build_snapshot(
+        self,
+        rnd: int,
+        eval_data: Dict[str, Any],
+        loss: float,
+        n_labels: int,
+    ) -> RoundSnapshot:
+        component_means = {
+            k: float(np.mean(v)) for k, v in eval_data.get("component_sums", {}).items()
+        }
+        successes = eval_data.get("success")
+        success_rate = (
+            float(np.mean([1.0 if s else 0.0 for s in successes]))
+            if successes is not None
+            else None
+        )
+        return RoundSnapshot(
+            rnd                = rnd,
+            component_means    = component_means,
+            episode_length     = float(np.mean(eval_data["episode_lengths"])),
+            episode_env_reward = float(np.mean(eval_data["episode_env_rewards"])),
+            success_rate       = success_rate,
+            loss               = loss,
+            n_labels           = n_labels,
+        )
 
     # ── private: LLM call ────────────────────────────────────
 
@@ -143,12 +173,14 @@ class ReflectionEngine:
         if self.verbose:
             print("\n  [Reflection] Calling LLM...")
 
+        training_summary = _format_training_history(self.snapshots)
         prompt = _build_prompt(
-            status        = _status(self._history),
-            reward_code   = self.reward_code,
-            semantic_code = self.semantic_code,
-            task          = self.task,
+            task             = self.task,
+            reward_code      = self.reward_code,
+            semantic_code    = self.semantic_code,
+            training_summary = training_summary,
         )
+
         resp = client.chat.completions.create(
             model           = self.llm_model,
             messages        = [{"role": "user", "content": prompt}],
@@ -156,38 +188,81 @@ class ReflectionEngine:
             temperature     = 0.3,
         )
         result = json.loads(resp.choices[0].message.content)
+        result["round"] = self.snapshots[-1].rnd
 
         if self.verbose:
-            print(f"  → {result.get('option','?')} | {result.get('diagnosis','')}")
+            analysis = (result.get("analysis") or "")[:240]
+            print(f"  → {analysis}")
 
         self._apply(result)
-        self._cache(result)
         self.log.append(result)
-        self._plateau = 0
         return result
 
     # ── private: apply ───────────────────────────────────────
 
     def _apply(self, result: dict) -> None:
-        option   = result.get("option", "")
-        code     = result.get("code")
-        fn_name  = result.get("fn_name")
-        guidance = result.get("guidance")
+        reward_code   = result.get("reward_code")
+        semantic_code = result.get("semantic_code")
 
-        if option in ("A", "B") and code and fn_name:
-            self._hot_swap(fn_name, code)
-        elif option == "C" and guidance:
-            self.sampler.comparison_guidance = guidance
+        reward_swapped = False
+        if reward_code:
+            reward_swapped = self._hot_swap(reward_code, "reward", "reward_reflected")
+        if semantic_code:
+            self._hot_swap(semantic_code, "summarize", "semantic_reflected")
+
+        # r_fixed changed → buffer's labels were assigned under the previous
+        # r_fixed and are now stale. Relabel with the new function so the BT
+        # model is trained against consistent taste.
+        if reward_swapped and self.reward_model is not None:
+            n = self.reward_model.relabel_buffer(self.composite.r_fixed)
             if self.verbose:
-                print("  ✓ guidance updated")
+                print(f"  ✓ buffer relabelled under new r_fixed ({n} pairs)")
 
-    def _hot_swap(self, fn_name: str, code: str) -> None:
+    def _smoke_test(self, fn, fn_name: str) -> bool:
+        """Verify a freshly compiled fn runs cleanly on a sample input and
+        does not return NaN/Inf. Returns True if safe to install."""
+        env = self.sampler.env
+        try:
+            obs    = env.observation_space.sample()
+            action = env.action_space.sample()
+
+            if fn_name == "reward":
+                out = fn(obs, action, obs)
+                if isinstance(out, dict):
+                    vals = [float(v) for v in out.values()]
+                else:
+                    vals = [float(out)]
+                if not all(np.isfinite(v) for v in vals):
+                    print(f"  Warning: new reward returned non-finite values; keeping current version")
+                    return False
+
+            elif fn_name == "summarize":
+                fake_step = (obs, action, obs, {"total": 0.0, "dummy": 0.0}, False)
+                out = fn([fake_step, fake_step])
+                if not isinstance(out, str):
+                    print(f"  Warning: new summarize did not return a string; keeping current version")
+                    return False
+
+            return True
+        except Exception as e:
+            print(f"  Warning: {fn_name} smoke test raised {type(e).__name__}: {e}; keeping current version")
+            return False
+
+    def _hot_swap(self, code: str, fn_name: str, cache_name: str) -> bool:
+        """Returns True if the swap actually went through."""
         code = code.removeprefix("```python").removesuffix("```").strip()
         try:
             fn = _exec_fn(code, fn_name)
         except Exception as e:
-            print(f"  Warning: compile failed ({e}), keeping old version")
-            return
+            print(f"  Warning: {fn_name} compile failed ({e}); keeping current version")
+            return False
+
+        # smoke test — refuse to install something that errors or returns
+        # non-finite values on a sample input, since the resulting NaNs poison
+        # the whole training-history block fed back into the next reflection.
+        if not self._smoke_test(fn, fn_name):
+            return False
+
         if fn_name == "reward":
             self.composite.r_fixed = fn
             self.reward_code       = code
@@ -197,18 +272,10 @@ class ReflectionEngine:
             self.sampler.semantic_fn = fn
             self.semantic_code       = code
             if self.verbose:
-                print("  ✓ semantic layer updated")
+                print("  ✓ summarize updated")
 
-    # ── private: cache ───────────────────────────────────────
-
-    def _cache(self, result: dict) -> None:
-        if result.get("option") not in ("A", "B"):
-            return
-        code    = result.get("code")
-        fn_name = result.get("fn_name")
-        if not code or not fn_name:
-            return
-        name = "reward_reflected" if fn_name == "reward" else "semantic_reflected"
-        path = CACHE_DIR / f"{name}.py"
+        # cache to disk for inspection
+        path = CACHE_DIR / f"{cache_name}.py"
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         path.write_text(code)
+        return True

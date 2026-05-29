@@ -14,9 +14,10 @@ Trajectory = List[Tuple]
 # ─────────────────────────────────────────────────────────────
 
 def oracle_label(traj_a: Trajectory, traj_b: Trajectory) -> int:
-    """Return 1 if traj_a has higher true reward sum, else 0."""
-    r_a = sum(t[3] for t in traj_a)
-    r_b = sum(t[3] for t in traj_b)
+    """Return 1 if traj_a has higher r_total sum, else 0.
+    r_total is read from the r_comp dict stored in each step's reward slot."""
+    r_a = sum(float(t[3]["total"]) for t in traj_a)
+    r_b = sum(float(t[3]["total"]) for t in traj_b)
     return 1 if r_a >= r_b else 0
 
 
@@ -47,6 +48,7 @@ class Sampler:
         use_oracle: bool = False,
         llm_model: str = "gpt-4o-mini",
         verbose: bool = True,
+        reward_fn: Optional[Callable] = None,
     ):
         self.env            = env
         self.policy_fn      = policy_fn
@@ -57,9 +59,7 @@ class Sampler:
         self.use_oracle     = use_oracle
         self.llm_model      = llm_model
         self.verbose        = verbose
-
-        # set by ReflectionEngine (Option C) to steer LLM comparisons
-        self.comparison_guidance: str = ""
+        self.reward_fn      = reward_fn
 
     # ── public ───────────────────────────────────────────────
 
@@ -97,8 +97,8 @@ class Sampler:
 
         correct, total = 0, 0
         for _ in range(n_pairs):
-            traj_a = collect_trajectory(self.env, self.policy_fn, self.seg_len)
-            traj_b = collect_trajectory(self.env, self.policy_fn, self.seg_len)
+            traj_a = collect_trajectory(self.env, self.policy_fn, self.seg_len, reward_fn=self.reward_fn)
+            traj_b = collect_trajectory(self.env, self.policy_fn, self.seg_len, reward_fn=self.reward_fn)
             llm   = self._query_label(traj_a, traj_b)
             truth = oracle_label(traj_a, traj_b)
             correct += int(llm == truth)
@@ -112,8 +112,8 @@ class Sampler:
         self, n_queries: int, use_active: bool
     ) -> Tuple[List[Trajectory], List[Trajectory]]:
         n = n_queries * self.CANDIDATE_RATIO if use_active else n_queries
-        trajs_a = [collect_trajectory(self.env, self.policy_fn, self.seg_len) for _ in range(n)]
-        trajs_b = [collect_trajectory(self.env, self.policy_fn, self.seg_len) for _ in range(n)]
+        trajs_a = [collect_trajectory(self.env, self.policy_fn, self.seg_len, reward_fn=self.reward_fn) for _ in range(n)]
+        trajs_b = [collect_trajectory(self.env, self.policy_fn, self.seg_len, reward_fn=self.reward_fn) for _ in range(n)]
         return trajs_a, trajs_b
 
     def _select_by_disagreement(
@@ -137,17 +137,10 @@ class Sampler:
         if self.use_oracle:
             return oracle_label(traj_a, traj_b)
 
-        # append comparison_guidance to task description if set by ReflectionEngine
-        task_with_guidance = (
-            f"{self.task}\n\nAdditional guidance: {self.comparison_guidance}"
-            if self.comparison_guidance
-            else self.task
-        )
-
         label, explanation = compare_trajectories(
             traj_a, traj_b,
             semantic_fn=self.semantic_fn,
-            task_description=task_with_guidance,
+            task_description=self.task,
             model=self.llm_model,
         )
         if self.verbose:

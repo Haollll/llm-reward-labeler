@@ -20,7 +20,7 @@ class TrainerConfig:
     segment_length: int     = 50        # steps per trajectory segment
     reward_epochs: int      = 50        # reward model training epochs per round
     ppo_steps: int          = 20_000    # PPO timesteps per round
-    eval_every: int         = 2         # evaluate every N rounds
+    eval_every: int         = 1         # evaluate every N rounds
     rounds: int             = 9
     artifact_dir: str       = "artifacts"
     progress_bar: bool      = True
@@ -90,6 +90,7 @@ class Trainer:
             use_oracle     = cfg.use_oracle,
             llm_model      = cfg.llm_model,
             verbose        = cfg.verbose,
+            reward_fn      = self.reward_fn,
         )
         self.reflection: Optional[ReflectionEngine] = None
         
@@ -101,6 +102,7 @@ class Trainer:
                 semantic_code    = semantic_code,
                 composite_reward = composite,
                 sampler          = self.sampler,
+                reward_model     = self.reward_model,
                 llm_model        = cfg.llm_model,
                 verbose          = cfg.verbose,
             )
@@ -166,7 +168,7 @@ class Trainer:
             print(f"  Labels added: {added} | buffer: {len(self.reward_model.buffer)}")
 
     def _reward_model_step(self) -> float:
-        batch_size = min(64, len(self.reward_model.buffer))
+        batch_size = min(10, len(self.reward_model.buffer))
         if self.cfg.verbose:
             print(
                 f"  Training reward model | epochs {self.cfg.reward_epochs} "
@@ -187,18 +189,24 @@ class Trainer:
         if self.cfg.verbose:
             print(section(f"Evaluation (round {rnd})"))
 
-        mean_r = self.agent.evaluate(n_episodes=5)
+        # k-episode evaluation: full per-component breakdown + global metrics
+        import numpy as np
+        from env_setup import eval_with_components
+
+        eval_data = eval_with_components(
+            self._sample_env,
+            self.agent.predict_deterministic,
+            self.reward_fn,
+            n_episodes=10,
+        )
+        mean_r = float(np.mean(eval_data["episode_env_rewards"]))
         self.eval_rewards.append(mean_r)
         if self.cfg.verbose:
-            print(f"  True reward (5 ep): {mean_r:.1f}")
-
-        acc = self.sampler.measure_label_accuracy(n_pairs=15)
-        self.label_accuracies.append(acc)
-        if self.cfg.verbose:
-            print(f"  LLM label accuracy: {acc:.1%}")
+            mean_len = float(np.mean(eval_data["episode_lengths"]))
+            print(f"  Env reward (10 ep mean): {mean_r:.1f} | length: {mean_len:.0f}")
 
         if self.reflection is not None:
-            self.reflection.step(rnd, mean_r, loss, acc, len(self.reward_model.buffer))
+            self.reflection.step(rnd, eval_data, loss, len(self.reward_model.buffer))
             
     # ── private: summary ─────────────────────────────────────
 

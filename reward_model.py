@@ -19,7 +19,7 @@ def _build_net(in_size: int, hidden: int = 256) -> nn.Sequential:
     return nn.Sequential(
         nn.Linear(in_size, hidden), nn.LeakyReLU(0.01),
         nn.Linear(hidden, hidden),  nn.LeakyReLU(0.01),
-        nn.Linear(hidden, 1),       nn.Tanh(),
+        nn.Linear(hidden, 1),
     )
 
 
@@ -58,6 +58,37 @@ class PreferenceBuffer:
         idxs    = np.random.choice(max_idx, size=min(batch_size, max_idx), replace=False)
         return self.seg1[idxs], self.seg2[idxs], self.label[idxs]
 
+    def relabel(self, reward_fn, obs_dim: int) -> int:
+        """Recompute every stored label under `reward_fn`.
+
+        For each segment, sum `reward_fn(obs_t, action_t, next_obs_t)["total"]`
+        across timesteps. `next_obs_t` is taken to be `obs_{t+1}` within the
+        segment; the final step reuses the last obs since the next transition
+        is not stored.
+        """
+        n = self.capacity if self.full else self.index
+        if n == 0:
+            return 0
+
+        T = self.size_segment
+
+        def _segment_sum(seg: np.ndarray) -> float:
+            total = 0.0
+            for t in range(T):
+                obs    = seg[t, :obs_dim]
+                action = seg[t,  obs_dim:]
+                next_obs = seg[t + 1, :obs_dim] if t + 1 < T else seg[T - 1, :obs_dim]
+                r = reward_fn(obs, action, next_obs)
+                total += float(r.get("total", 0.0)) if isinstance(r, dict) else float(r)
+            return total
+
+        for i in range(n):
+            s1 = _segment_sum(self.seg1[i])
+            s2 = _segment_sum(self.seg2[i])
+            self.label[i, 0] = 1.0 if s1 >= s2 else 0.0
+
+        return n
+
     def __len__(self):
         return self.capacity if self.full else self.index
 
@@ -81,6 +112,8 @@ class RewardModel:
         lr: float          = 3e-4,
         size_segment: int  = 50,
         capacity: int      = 5000,
+        lambda_smooth: float = 1.0,
+        weight_decay: float  = 1e-4,
     ):
         env_desc = describe_env(env)
         obs_dim = _space_dim(env_desc["observation_space"])
@@ -92,13 +125,16 @@ class RewardModel:
         self.ensemble_size = ensemble_size
         self.size_segment  = size_segment
         self.hidden        = hidden
+        self.lambda_smooth = lambda_smooth
 
         self.nets = [
             _build_net(self.sa_dim, hidden).float().to(DEVICE)
             for _ in range(ensemble_size)
         ]
         self.optimizer = optim.Adam(
-            [p for net in self.nets for p in net.parameters()], lr=lr
+            [p for net in self.nets for p in net.parameters()],
+            lr=lr,
+            weight_decay=weight_decay,
         )
         self.ce_loss = nn.CrossEntropyLoss()
         self.buffer  = PreferenceBuffer(capacity, size_segment, self.sa_dim)
@@ -107,9 +143,24 @@ class RewardModel:
         """label: 1.0 = seg1 better, 0.0 = seg2 better"""
         self.buffer.add(seg1, seg2, label)
 
-    def _sum_reward(self, seg: np.ndarray, member: int) -> torch.Tensor:
-        """seg: (B, T, sa_dim) → (B, 1)"""
-        return self.nets[member](torch.FloatTensor(seg).to(DEVICE)).sum(axis=1)
+    def relabel_buffer(self, reward_fn) -> int:
+        """Recompute every stored buffer label under the supplied reward_fn.
+
+        Returns the number of pairs relabelled. Cheap (pure-Python loop over
+        stored segments, no LLM calls) so safe to invoke after every r_fixed
+        rewrite to keep the buffer's taste in sync with the current reward.
+        """
+        return self.buffer.relabel(reward_fn, self.obs_dim)
+
+    def _per_step_reward(self, seg, member: int) -> torch.Tensor:
+        """seg: (B, T, sa_dim) → (B, T, 1)"""
+        if not torch.is_tensor(seg):
+            seg = torch.FloatTensor(seg).to(DEVICE)
+        return self.nets[member](seg)
+
+    def _sum_reward(self, seg, member: int) -> torch.Tensor:
+        """seg: (B, T, sa_dim) → (B, 1). Mean over time keeps BT logits on a per-step scale."""
+        return self._per_step_reward(seg, member).mean(dim=1)
 
     def train(
         self,
@@ -127,18 +178,24 @@ class RewardModel:
 
         for _ in epochs:
             seg1, seg2, labels = self.buffer.sample(batch_size)
+            seg1_t = torch.from_numpy(seg1).to(DEVICE)
+            seg2_t = torch.from_numpy(seg2).to(DEVICE)
             target = torch.from_numpy(
                 (1 - labels.flatten()).astype(np.int64)
             ).to(DEVICE)
             self.optimizer.zero_grad()
-            loss = sum(
-                self.ce_loss(
-                    torch.cat([self._sum_reward(seg1, m),
-                               self._sum_reward(seg2, m)], dim=-1),
-                    target,
-                )
-                for m in range(self.ensemble_size)
-            )
+            loss = 0.0
+            for m in range(self.ensemble_size):
+                r1 = self._per_step_reward(seg1_t, m)  # (B, T, 1)
+                r2 = self._per_step_reward(seg2_t, m)
+                logits = torch.cat([r1.mean(dim=1), r2.mean(dim=1)], dim=-1)
+                loss = loss + self.ce_loss(logits, target)
+                if self.lambda_smooth > 0:
+                    smooth = (
+                        (r1[:, 1:] - r1[:, :-1]).pow(2).mean()
+                      + (r2[:, 1:] - r2[:, :-1]).pow(2).mean()
+                    )
+                    loss = loss + self.lambda_smooth * smooth
             loss.backward()
             nn.utils.clip_grad_norm_(
                 [p for net in self.nets for p in net.parameters()], 1.0
