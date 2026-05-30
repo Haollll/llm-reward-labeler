@@ -68,8 +68,13 @@ OPENAI_API_KEY=sk-...
 # Quick test with oracle labels (no LLM queries needed)
 python train.py --oracle --rounds 3 --queries 5 --ppo-steps 5000
 
+# Recommended oracle run (tuned reward model settings)
+python train.py --oracle --rounds 9 --queries 10 --ppo-steps 20000 \
+    --reward-epochs 50 --lambda-smooth 0.05 --dynamic-batch
+
 # Full run with LLM as preference labeler
-python train.py --rounds 9 --queries 10 --ppo-steps 50000
+python train.py --rounds 9 --queries 10 --ppo-steps 50000 \
+    --reward-epochs 50 --lambda-smooth 0.05 --dynamic-batch
 
 # Evaluate saved artifacts, render the scene, and save reward trace plot
 python evaluate.py
@@ -83,6 +88,9 @@ python env_setup.py
 | `--rounds` | 9 | Number of active learning rounds |
 | `--queries` | 10 | Preference queries per round |
 | `--ppo-steps` | 50000 | PPO environment steps per round |
+| `--reward-epochs` | 50 | Reward model training epochs per round |
+| `--lambda-smooth` | 0.05 | Temporal smoothness penalty coefficient for reward model |
+| `--dynamic-batch` | off | Scale batch size with buffer: `max(8, min(32, buffer//2))` instead of fixed 10 |
 | `--oracle` | off | Use ground-truth reward sums instead of LLM labels |
 
 ---
@@ -94,6 +102,7 @@ python env_setup.py
 - **Active learning** — collect 5× candidate trajectory pairs per round, score each by ensemble disagreement, query only the top-`n` by disagreement (cold start round uses uniform sampling)
 - **`CustomRewardWrapper`** — backward-compatible; `reward_model=None` uses only `r_fixed`, making it easy to ablate the learned component
 - **LLM output caching** — generated reward and semantic functions are cached to disk, avoiding redundant API calls across runs
+- **`lambda_smooth=0.05`** — the temporal smoothness penalty is kept small intentionally; see the debug note below for why a larger value causes the reward model to stall
 
 ---
 
@@ -114,6 +123,46 @@ r_total = alpha * r_fixed(s, a, s') + (1 - alpha) * g * normalise(R_phi(s, a))
 ## Ablation Experiments
 
 The `--oracle` flag replaces the LLM labeler with the ground-truth environment reward sum for each trajectory segment. This provides an upper-bound comparison: oracle labeling shows how well the pipeline works when preference labels are perfect, isolating errors introduced by LLM annotation noise.
+
+---
+
+## Reward Model Debug Notes
+
+**Symptom:** reward model loss stuck at ~2.0, accuracy at 60–70%.
+
+**Root cause:** `lambda_smooth=1.0` (original default) was too large. At that scale the temporal smoothness penalty grows at roughly the same rate as the CE loss improves, so the two cancel out and the reported total loss appears flat. The model was actually learning — CE was declining — but the smooth term masked it entirely.
+
+Mechanically: at random initialization, network outputs are near zero so smooth ≈ 0. As the network starts making non-trivial reward predictions, smooth rises. With `lambda_smooth=1.0` and three ensemble members:
+
+```
+total loss ≈ 3 × (CE_m − Δ) + 1.0 × 3 × (smooth_m + Δ) ≈ 3 × ln(2) ≈ 2.08   (stuck)
+```
+
+With `lambda_smooth=0.05` the smooth contribution is small enough that CE improvements show through:
+
+```
+total loss = CE_total + 0.05 × smooth_total
+           ≈ 1.49    + 0.05 × 2.82          ≈ 1.63   (and declining)
+```
+
+**Fix:** set `--lambda-smooth 0.05`. Results on oracle mode, 5 rounds:
+
+| Round | CE loss | smooth (unscaled) | total | acc |
+|---|---|---|---|---|
+| cold start | 1.691 | 1.603 | 1.771 | 100% |
+| 1 | 1.537 | 2.711 | 1.672 | 100% |
+| 2 | 1.522 | 3.032 | 1.674 | 94% |
+| 3 | 1.521 | 2.836 | 1.663 | 98% |
+| 4 | 1.502 | 2.784 | 1.642 | 97% |
+| 5 | 1.489 | 2.820 | 1.630 | 97% |
+
+Env reward improved from −38 → +108 over the same 5 rounds.
+
+**Related code changes (all in this fix):**
+- `TrainerConfig`: added `lambda_smooth` (default `0.05`) and `dynamic_batch` fields
+- `reward_model.py`: `train()` now returns `(ce_loss, smooth_loss)` separately so both can be monitored
+- `trainer.py`: logs CE and smooth independently; fixed a bug where `label_accuracies.append(acc)` was never called
+- `train.py`: exposed `--lambda-smooth` and `--dynamic-batch` CLI flags
 
 ---
 

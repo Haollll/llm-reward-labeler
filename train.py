@@ -20,6 +20,8 @@ def parse_args() -> TrainerConfig:
     p.add_argument("--no-progress-bar", action="store_true")
     p.add_argument("--model", default="gpt-4o-mini")
     p.add_argument("--quiet", action="store_true")
+    p.add_argument("--lambda-smooth", type=float, default=1.0)
+    p.add_argument("--dynamic-batch", action="store_true")
     args = p.parse_args()
 
     return TrainerConfig(
@@ -35,6 +37,8 @@ def parse_args() -> TrainerConfig:
         progress_bar=not args.no_progress_bar,
         llm_model=args.model,
         verbose=not args.quiet,
+        lambda_smooth=args.lambda_smooth,
+        dynamic_batch=args.dynamic_batch,
     )
 
 

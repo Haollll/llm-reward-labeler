@@ -167,10 +167,12 @@ class RewardModel:
         batch_size: int = 64,
         n_epochs: int = 50,
         progress_bar: bool = False,
-    ) -> float:
+    ) -> tuple[float, float]:
+        """Returns (ce_loss, smooth_loss) averaged over epochs."""
         if len(self.buffer) < batch_size:
-            return 0.0
-        total = 0.0
+            return 0.0, 0.0
+        total_ce = 0.0
+        total_smooth = 0.0
         epochs = range(n_epochs)
         if progress_bar:
             from tqdm.auto import tqdm
@@ -184,25 +186,28 @@ class RewardModel:
                 (1 - labels.flatten()).astype(np.int64)
             ).to(DEVICE)
             self.optimizer.zero_grad()
-            loss = 0.0
+            ce_term = 0.0
+            smooth_term = 0.0
             for m in range(self.ensemble_size):
                 r1 = self._per_step_reward(seg1_t, m)  # (B, T, 1)
                 r2 = self._per_step_reward(seg2_t, m)
                 logits = torch.cat([r1.mean(dim=1), r2.mean(dim=1)], dim=-1)
-                loss = loss + self.ce_loss(logits, target)
+                ce_term = ce_term + self.ce_loss(logits, target)
                 if self.lambda_smooth > 0:
                     smooth = (
                         (r1[:, 1:] - r1[:, :-1]).pow(2).mean()
                       + (r2[:, 1:] - r2[:, :-1]).pow(2).mean()
                     )
-                    loss = loss + self.lambda_smooth * smooth
+                    smooth_term = smooth_term + smooth
+            loss = ce_term + self.lambda_smooth * smooth_term
             loss.backward()
             nn.utils.clip_grad_norm_(
                 [p for net in self.nets for p in net.parameters()], 1.0
             )
             self.optimizer.step()
-            total += loss.item()
-        return total / n_epochs
+            total_ce     += ce_term.item()     if torch.is_tensor(ce_term)     else float(ce_term)
+            total_smooth += smooth_term.item() if torch.is_tensor(smooth_term) else float(smooth_term)
+        return total_ce / n_epochs, total_smooth / n_epochs
 
     def predict(self, obs: np.ndarray, action: np.ndarray) -> float:
         """Single-step reward prediction for RewardWrappedEnv"""

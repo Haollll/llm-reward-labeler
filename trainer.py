@@ -26,6 +26,8 @@ class TrainerConfig:
     progress_bar: bool      = True
     llm_model: str          = "gpt-4o-mini"
     verbose: bool           = True
+    lambda_smooth: float    = 1.0         # reward model temporal-smooth penalty
+    dynamic_batch: bool     = False       # use max(8,min(32,buffer//2)) vs min(10,buffer)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -64,6 +66,7 @@ class Trainer:
         self.reward_model = RewardModel(
             env           = _env,
             size_segment  = cfg.segment_length,
+            lambda_smooth = cfg.lambda_smooth,
         )
         _env.close()
 
@@ -108,7 +111,9 @@ class Trainer:
             )
         # ── logging ──────────────────────────────────────────
         self.eval_rewards:     list[float] = []
-        self.reward_losses:    list[float] = []
+        self.reward_losses:    list[float] = []   # total = CE + λ*smooth
+        self.ce_losses:        list[float] = []   # CE only
+        self.smooth_losses:    list[float] = []   # smooth only (unscaled)
         self.label_accuracies: list[float] = []
         self.artifact_root = Path(cfg.artifact_dir)
 
@@ -168,22 +173,33 @@ class Trainer:
             print(f"  Labels added: {added} | buffer: {len(self.reward_model.buffer)}")
 
     def _reward_model_step(self) -> float:
-        batch_size = min(10, len(self.reward_model.buffer))
+        n = len(self.reward_model.buffer)
+        if self.cfg.dynamic_batch:
+            batch_size = max(8, min(32, n // 2)) if n >= 2 else max(1, n)
+        else:
+            batch_size = min(10, n)
         if self.cfg.verbose:
             print(
                 f"  Training reward model | epochs {self.cfg.reward_epochs} "
-                f"| batch {batch_size} | labels {len(self.reward_model.buffer)}"
+                f"| batch {batch_size} | labels {n}"
             )
-        loss = self.reward_model.train(
+        ce_loss, smooth_loss = self.reward_model.train(
             batch_size=batch_size,
             n_epochs=self.cfg.reward_epochs,
             progress_bar=self.cfg.progress_bar,
         )
+        total_loss = ce_loss + self.cfg.lambda_smooth * smooth_loss
         acc = self.reward_model.accuracy()
-        self.reward_losses.append(loss)
+        self.reward_losses.append(total_loss)
+        self.ce_losses.append(ce_loss)
+        self.smooth_losses.append(smooth_loss)
+        self.label_accuracies.append(acc)
         if self.cfg.verbose:
-            print(f"  Reward model | loss {loss:.4f} | acc {acc:.2%}")
-        return loss
+            print(
+                f"  Reward model | CE {ce_loss:.4f} | smooth {smooth_loss:.4f}"
+                f" | total {total_loss:.4f} | acc {acc:.2%}"
+            )
+        return total_loss
 
     def _eval_step(self, rnd: int, loss: float) -> None:
         if self.cfg.verbose:
