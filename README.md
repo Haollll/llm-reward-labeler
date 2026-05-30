@@ -37,7 +37,8 @@ The agent is PPO on `HalfCheetah-v5`. An `--oracle` flag replaces the LLM labele
 │   ├── semantic.md       # Prompt template: trajectory-to-text semantic layer
 │   └── compare.md        # Prompt template: pairwise trajectory comparison
 └── tasks/
-    └── halfcheetah.txt   # Task description for HalfCheetah-v5
+    ├── halfcheetah.txt         # Task description with full obs layout (recommended)
+    └── halfcheetah_minimal.txt # Minimal task description without obs layout (tests reflection)
 ```
 
 ---
@@ -103,6 +104,7 @@ python env_setup.py
 - **`CustomRewardWrapper`** — backward-compatible; `reward_model=None` uses only `r_fixed`, making it easy to ablate the learned component
 - **LLM output caching** — generated reward and semantic functions are cached to disk, avoiding redundant API calls across runs
 - **`lambda_smooth=0.05`** — the temporal smoothness penalty is kept small intentionally; see the debug note below for why a larger value causes the reward model to stall
+- **Explicit obs layout in task description** — `tasks/halfcheetah.txt` annotates every observation dimension (e.g. "obs[8] is forward velocity, not position"). Without this, the LLM can misinterpret the observation semantics and generate a reward function anti-correlated with the true objective; see the debug note below
 
 ---
 
@@ -163,6 +165,47 @@ Env reward improved from −38 → +108 over the same 5 rounds.
 - `reward_model.py`: `train()` now returns `(ce_loss, smooth_loss)` separately so both can be monitored
 - `trainer.py`: logs CE and smooth independently; fixed a bug where `label_accuracies.append(acc)` was never called
 - `train.py`: exposed `--lambda-smooth` and `--dynamic-batch` CLI flags
+
+---
+
+## LLM Reward Function Debug Notes
+
+**Symptom:** env reward collapsed as `alpha` decreased — the more the agent relied on `R_phi`, the worse it performed. In oracle mode, 9 rounds:
+
+| Round | alpha | env reward |
+|---|---|---|
+| 2 | 0.875 | +361 |
+| 4 | 0.625 | −57 |
+| 6 | 0.375 | −112 |
+| 8 | 0.125 | −328 |
+
+Confusingly, `R_phi`'s CE loss was *declining* (1.45 → 1.13) and accuracy held at 90%+ — the reward model looked healthy by its own metrics.
+
+**Diagnosis:** `diagnose_reward_model.py` measured the Pearson correlation between `R_phi`'s per-step predictions and the true environment reward over 5000 steps:
+
+```
+Step-level    Pearson r : −0.17
+Segment-level Pearson r : −0.49
+```
+
+Both correlations are **negative**: `R_phi` was assigning *high* predicted rewards to states that produce *low* true env reward. PPO maximising `R_phi` therefore drove env reward down. The segment-level magnitude (0.49) being much larger than the step-level (0.17) also confirmed that R_phi only carries meaningful signal at segment granularity — consistent with how it was trained.
+
+**Root cause:** the LLM-generated `reward_fn` misread the HalfCheetah observation layout. `obs[8]` is already **forward velocity** (as defined by MuJoCo), but the LLM treated it as a position and computed `dx = next_obs[8] − obs[8]`, effectively rewarding *acceleration* rather than velocity. This made `r_fixed` (and the oracle labels derived from it) anti-correlated with the true objective, so `R_phi` learned the wrong ranking.
+
+**Fix:** `tasks/halfcheetah.txt` was updated to include an explicit per-dimension obs layout, clearly labelling `obs[8]` as velocity. With the corrected task description, the LLM generates a reward function that directly reads velocity, eliminating the sign inversion.
+
+**Results after fix** (oracle mode, 9 rounds):
+
+| Round | alpha | env reward |
+|---|---|---|
+| 2 | 0.875 | +294 |
+| 4 | 0.625 | +453 |
+| 6 | 0.375 | +494 |
+| 8 | 0.125 | +556 |
+
+Env reward now *increases* as alpha decreases — the agent learns to rely on `R_phi` and improves.
+
+**Broader insight:** LLMs routinely misinterpret observation vectors for physics simulators because the variable names in MuJoCo XML are terse and the semantics (position vs velocity vs angle) are not obvious from the name alone. Providing an annotated obs layout in the task description is a simple, high-leverage fix. An alternative is to rely on the reflection mechanism to detect and correct misaligned reward functions at runtime — `tasks/halfcheetah_minimal.txt` omits the obs layout intentionally to test whether reflection can recover from this class of error.
 
 ---
 

@@ -1,1 +1,15 @@
 Make the HalfCheetah robot run to the right as fast as possible, with smooth actions, low energy use, and stable body posture.
+
+Observation layout (17 dims):
+- obs[0]: z-position (height) of the body
+- obs[1]: angle of the body
+- obs[2:8]: joint angles
+- obs[8]: forward (x-axis) velocity of the body — this is ALREADY a velocity, not a position
+- obs[9]: vertical (z-axis) velocity
+- obs[10:17]: joint angular velocities
+
+Action: 6 joint torques in [-1, 1].
+
+Key point: to reward forward speed, use next_obs[8] directly. Do NOT compute a
+position difference like (next_obs[8] - obs[8]); obs[8] is already the velocity,
+so differencing it gives acceleration, which is wrong.
