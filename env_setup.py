@@ -177,7 +177,6 @@ if __name__ == "__main__":
     composite = CompositeReward(
         r_fixed=reward_fn,
         cache_key=cache_key(env, task),
-        # g=...           # defaults to constant 1
         # reward_model=...  # plug in Bradley-Terry model once trained
     )
     wrapped_env = CustomRewardWrapper(env, composite)

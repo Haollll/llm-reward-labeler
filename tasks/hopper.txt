@@ -1,0 +1,25 @@
+Make the one-legged hopper hop to the right (positive x) as fast as possible while staying upright and "healthy", with smooth, low-energy actions.
+
+Observation layout (11 dims):
+- obs[0]: z-position (height) of the torso
+- obs[1]: angle of the torso
+- obs[2]: angle of the thigh joint
+- obs[3]: angle of the leg joint
+- obs[4]: angle of the foot joint
+- obs[5]: forward (x-axis) velocity of the torso — this is ALREADY a velocity
+- obs[6]: vertical (z-axis) velocity of the torso
+- obs[7]: angular velocity of the torso angle
+- obs[8]: angular velocity of the thigh joint
+- obs[9]: angular velocity of the leg joint
+- obs[10]: angular velocity of the foot joint
+
+Action: 3 joint torques (thigh, leg, foot) in [-1, 1].
+
+Task notes:
+- To reward forward speed use next_obs[5] directly; it is a velocity, so do NOT
+  difference it across steps.
+- The episode terminates early if the hopper becomes unhealthy (torso height too
+  low or body angle too extreme); max horizon is 1000 steps. Add a survival/alive
+  bonus and reward keeping obs[0] (height) and obs[1] (torso angle) in a healthy
+  upright range, so the policy does not earn a one-off forward burst and then fall.
+- Penalise large control torques (energy).

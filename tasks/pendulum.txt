@@ -1,0 +1,19 @@
+Swing the pendulum up and keep it balanced upright (pointing straight up) for as long as possible, using as little torque as possible.
+
+Observation layout (3 dims):
+- obs[0]: cos(theta) — equals +1 when the pendulum is perfectly upright, -1 when hanging straight down
+- obs[1]: sin(theta) — 0 when upright or fully down; its sign tells you which side the pendulum has swung to
+- obs[2]: angular velocity of the pendulum (theta_dot)
+
+Action: 1 continuous torque applied at the pivot, in [-2, 2].
+
+Task notes:
+- "Upright" corresponds to obs[0] (cos theta) close to +1 and obs[1] (sin theta)
+  close to 0. Reward being upright, and penalise the squared angular velocity
+  (obs[2]) so the pendulum settles rather than spinning, and the squared torque so
+  it uses little energy.
+- There is no early termination: every episode runs for a fixed horizon (200
+  steps), so the objective is to swing up quickly and then stay balanced upright
+  with minimal motion and effort for the rest of the episode.
+- The pendulum starts in a random position (often hanging down), so a good policy
+  must first build momentum to swing up before stabilising.

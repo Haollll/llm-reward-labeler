@@ -18,6 +18,7 @@ dependencies:
     - rich>=13.0
     - matplotlib==3.9.2
     - scipy==1.14.1
+    - rl_zoo3>=2.8            # train PPO baselines (RL Baselines3 Zoo)
 
 # Torch must be installed manually after `conda activate llm-reward`.
 # Pick one based on the device you want the reward model to use:

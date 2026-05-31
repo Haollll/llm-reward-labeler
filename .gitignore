@@ -224,3 +224,9 @@ __marimo__/
 .DS_Store
 artifacts/
 results/
+
+# rl-zoo3 trained baselines (model binaries)
+baselines/
+
+# experiment run logs
+logs/

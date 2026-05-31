@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -99,6 +100,7 @@ class ReflectionEngine:
         reflect_every: int = 1,
         llm_model:    str  = "gpt-4o",
         verbose:      bool = True,
+        output_dir = None,
     ):
         self.task           = task
         self.reward_code    = reward_code
@@ -109,6 +111,9 @@ class ReflectionEngine:
         self.reflect_every  = reflect_every
         self.llm_model      = llm_model
         self.verbose        = verbose
+        # where versioned reward/semantic snapshots and the reflection log are
+        # written; falls back to the global LLM cache dir if unset.
+        self.output_dir     = Path(output_dir) if output_dir is not None else CACHE_DIR
 
         self.snapshots: List[RoundSnapshot] = []
         self.log:       List[dict]          = []
@@ -188,27 +193,41 @@ class ReflectionEngine:
             temperature     = 0.3,
         )
         result = json.loads(resp.choices[0].message.content)
-        result["round"] = self.snapshots[-1].rnd
+        rnd = self.snapshots[-1].rnd
+        result["round"] = rnd
 
         if self.verbose:
             analysis = (result.get("analysis") or "")[:240]
             print(f"  → {analysis}")
 
-        self._apply(result)
-        self.log.append(result)
+        reward_swapped, semantic_swapped = self._apply(result, rnd)
+
+        # structured log entry: what the LLM proposed and what actually took.
+        self.log.append({
+            "round":            rnd,
+            "analysis":         result.get("analysis"),
+            "reasoning":        result.get("reasoning"),
+            "reward_proposed":  bool(result.get("reward_code")),
+            "reward_swapped":   reward_swapped,
+            "semantic_proposed": bool(result.get("semantic_code")),
+            "semantic_swapped": semantic_swapped,
+            "reward_code":      self.reward_code if reward_swapped else None,
+            "semantic_code":    self.semantic_code if semantic_swapped else None,
+        })
+        self._write_log()
         return result
 
     # ── private: apply ───────────────────────────────────────
 
-    def _apply(self, result: dict) -> None:
+    def _apply(self, result: dict, rnd: int) -> tuple[bool, bool]:
         reward_code   = result.get("reward_code")
         semantic_code = result.get("semantic_code")
 
-        reward_swapped = False
+        reward_swapped = semantic_swapped = False
         if reward_code:
-            reward_swapped = self._hot_swap(reward_code, "reward", "reward_reflected")
+            reward_swapped = self._hot_swap(reward_code, "reward", rnd)
         if semantic_code:
-            self._hot_swap(semantic_code, "summarize", "semantic_reflected")
+            semantic_swapped = self._hot_swap(semantic_code, "summarize", rnd)
 
         # r_fixed changed → buffer's labels were assigned under the previous
         # r_fixed and are now stale. Relabel with the new function so the BT
@@ -217,6 +236,13 @@ class ReflectionEngine:
             n = self.reward_model.relabel_buffer(self.composite.r_fixed)
             if self.verbose:
                 print(f"  ✓ buffer relabelled under new r_fixed ({n} pairs)")
+        return reward_swapped, semantic_swapped
+
+    def _write_log(self) -> None:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        (self.output_dir / "reflection_log.json").write_text(
+            json.dumps(self.log, indent=2)
+        )
 
     def _smoke_test(self, fn, fn_name: str) -> bool:
         """Verify a freshly compiled fn runs cleanly on a sample input and
@@ -248,7 +274,7 @@ class ReflectionEngine:
             print(f"  Warning: {fn_name} smoke test raised {type(e).__name__}: {e}; keeping current version")
             return False
 
-    def _hot_swap(self, code: str, fn_name: str, cache_name: str) -> bool:
+    def _hot_swap(self, code: str, fn_name: str, rnd: int) -> bool:
         """Returns True if the swap actually went through."""
         code = code.removeprefix("```python").removesuffix("```").strip()
         try:
@@ -266,16 +292,17 @@ class ReflectionEngine:
         if fn_name == "reward":
             self.composite.r_fixed = fn
             self.reward_code       = code
+            stem = f"reward_round{rnd}"
             if self.verbose:
                 print("  ✓ r_fixed updated")
         elif fn_name == "summarize":
             self.sampler.semantic_fn = fn
             self.semantic_code       = code
+            stem = f"semantic_round{rnd}"
             if self.verbose:
                 print("  ✓ summarize updated")
 
-        # cache to disk for inspection
-        path = CACHE_DIR / f"{cache_name}.py"
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        path.write_text(code)
+        # write a round-versioned snapshot so the full edit history is inspectable
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        (self.output_dir / f"{stem}.py").write_text(code)
         return True

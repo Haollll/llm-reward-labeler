@@ -1,5 +1,5 @@
 from collections import deque
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 import numpy as np
 
@@ -10,13 +10,11 @@ class CompositeReward:
         self,
         r_fixed: Callable[[Any, Any, Any], float],
         cache_key: str,
-        g: Optional[Callable[[Any, Any, Any], float]] = None,
         reward_model=None,
         alpha: float = 1.0,
     ):
         self.r_fixed = r_fixed
         self.cache_key = cache_key
-        self.g = g if g is not None else (lambda *_: 1.0)
         self.reward_model = reward_model
         self.alpha = float(np.clip(alpha, 0.0, 1.0))
         self._recent_abs: deque = deque(maxlen=200)
@@ -42,7 +40,5 @@ class CompositeReward:
         self._recent_abs.append(abs(r_phi))
         std        = float(np.std(self._recent_abs)) if len(self._recent_abs) > 10 else 1.0
         r_phi_norm = r_phi / (std + 1e-8)
- 
-        gate = float(self.g(obs, action, next_obs))
-        return self.alpha * r_fix + (1.0 - self.alpha) * gate * r_phi_norm
- 
+
+        return self.alpha * r_fix + (1.0 - self.alpha) * r_phi_norm

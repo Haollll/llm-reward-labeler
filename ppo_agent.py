@@ -15,7 +15,7 @@ class PPOAgent:
     Thin wrapper around stable-baselines3 PPO.
 
     The training environment uses CustomRewardWrapper so PPO optimizes
-    alpha * r_fixed + (1 - alpha) * g * R_phi instead of the gym reward.
+    alpha * r_fixed + (1 - alpha) * R_phi instead of the gym reward.
     Evaluation runs on a raw gym env so it reports true environment reward.
     """
 

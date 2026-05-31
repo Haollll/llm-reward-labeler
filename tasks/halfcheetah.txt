@@ -6,7 +6,8 @@ Observation layout (17 dims):
 - obs[2:8]: joint angles
 - obs[8]: forward (x-axis) velocity of the body — this is ALREADY a velocity, not a position
 - obs[9]: vertical (z-axis) velocity
-- obs[10:17]: joint angular velocities
+- obs[10]: angular velocity of the body angle
+- obs[11:17]: the 6 joint angular velocities
 
 Action: 6 joint torques in [-1, 1].
 

@@ -10,24 +10,12 @@ Trajectory = List[Tuple]
 
 
 # ─────────────────────────────────────────────────────────────
-# Ground-truth label (ablation / evaluation)
-# ─────────────────────────────────────────────────────────────
-
-def oracle_label(traj_a: Trajectory, traj_b: Trajectory) -> int:
-    """Return 1 if traj_a has higher r_total sum, else 0.
-    r_total is read from the r_comp dict stored in each step's reward slot."""
-    r_a = sum(float(t[3]["total"]) for t in traj_a)
-    r_b = sum(float(t[3]["total"]) for t in traj_b)
-    return 1 if r_a >= r_b else 0
-
-
-# ─────────────────────────────────────────────────────────────
 # Sampler
 # ─────────────────────────────────────────────────────────────
 
 class Sampler:
     """
-    Collects trajectory pairs and obtains preference labels.
+    Collects trajectory pairs and obtains LLM preference labels.
 
     Two query strategies:
       uniform — random pairs (used during cold start)
@@ -45,7 +33,6 @@ class Sampler:
         semantic_fn: Callable,
         task: str,
         segment_length: int = 50,
-        use_oracle: bool = False,
         llm_model: str = "gpt-4o-mini",
         verbose: bool = True,
         reward_fn: Optional[Callable] = None,
@@ -56,7 +43,6 @@ class Sampler:
         self.semantic_fn    = semantic_fn
         self.task           = task
         self.seg_len        = segment_length
-        self.use_oracle     = use_oracle
         self.llm_model      = llm_model
         self.verbose        = verbose
         self.reward_fn      = reward_fn
@@ -87,25 +73,6 @@ class Sampler:
 
         return added
 
-    def measure_label_accuracy(self, n_pairs: int = 15) -> float:
-        """
-        Estimate LLM label accuracy against oracle ground truth.
-        Only meaningful when use_oracle=False.
-        """
-        if self.use_oracle:
-            return 1.0
-
-        correct, total = 0, 0
-        for _ in range(n_pairs):
-            traj_a = collect_trajectory(self.env, self.policy_fn, self.seg_len, reward_fn=self.reward_fn)
-            traj_b = collect_trajectory(self.env, self.policy_fn, self.seg_len, reward_fn=self.reward_fn)
-            llm   = self._query_label(traj_a, traj_b)
-            truth = oracle_label(traj_a, traj_b)
-            correct += int(llm == truth)
-            total   += 1
-
-        return correct / total if total > 0 else 0.0
-
     # ── private ──────────────────────────────────────────────
 
     def _collect_candidates(
@@ -134,9 +101,6 @@ class Sampler:
         )
 
     def _query_label(self, traj_a: Trajectory, traj_b: Trajectory) -> int:
-        if self.use_oracle:
-            return oracle_label(traj_a, traj_b)
-
         label, explanation = compare_trajectories(
             traj_a, traj_b,
             semantic_fn=self.semantic_fn,

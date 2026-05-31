@@ -67,29 +67,60 @@ def _exec_fn(code: str, fn_name: str) -> Callable:
     return fn
 
 
+def _strip_fences(code: str) -> str:
+    """Strip ```python ... ``` markdown fences the LLM sometimes adds."""
+    code = code.strip()
+    if code.startswith("```"):
+        code = code.split("\n", 1)[1] if "\n" in code else code[3:]
+        code = code.removeprefix("python").lstrip("\n")
+    return code.removesuffix("```").strip()
+
+
+def _compile_and_validate(code: str, fn_name: str, validate):
+    """Returns (fn, None) if the code compiles and passes `validate`, else
+    (None, error_message). `validate` may be None (compile-only)."""
+    code = _strip_fences(code)
+    try:
+        fn = _exec_fn(code, fn_name)
+    except Exception as e:
+        return None, f"compile error: {type(e).__name__}: {e}"
+    if validate is not None:
+        try:
+            ok = validate(fn)
+        except Exception as e:
+            return None, f"runtime error on sample input: {type(e).__name__}: {e}"
+        if not ok:
+            return None, "validation failed (bad output type / non-finite values)"
+    return fn, None
+
+
 def _generate_code(
     prompt_name: str,
     fn_name: str,
     env_desc: Dict[str, Any],
     task: str,
     model: str,
+    validate=None,
+    max_attempts: int = 4,
 ) -> Tuple[str, Callable]:
     # Create a cache filename for the environment, task, and prompt
     safe_id = env_desc["env_id"].replace("/", "_")
     task_hash = _hash_task(env_desc["env_id"], task)
     cache_path = CACHE_DIR / f"{safe_id}_{task_hash}_{prompt_name}.py"
 
-    # Return the executable generated code if the result is cached
+    # Use the cached result only if it still compiles and validates — a cached
+    # but buggy generation would otherwise crash every future run.
     if cache_path.exists():
-        code = cache_path.read_text()
-        return code, _exec_fn(code, fn_name)
+        code = _strip_fences(cache_path.read_text())
+        fn, err = _compile_and_validate(code, fn_name, validate)
+        if fn is not None:
+            return code, fn
+        print(f"  ⚠ cached {prompt_name} fn invalid ({err}); regenerating")
 
-    # Otherwise, generate code using the LLM
     from openai import OpenAI
     client = OpenAI()
 
-    # First format the prompt by replacing placeholder values in the prompt using env_desc
-    prompt = _load_prompt(prompt_name).format(
+    base_prompt = _load_prompt(prompt_name).format(
         env_id=env_desc["env_id"],
         obs_space=env_desc["observation_space"],
         act_space=env_desc["action_space"],
@@ -97,17 +128,37 @@ def _generate_code(
         task=task,
     )
 
-    # Send the formatted prompt to the LLM and generate a response
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-    )
-    code = resp.choices[0].message.content # Extract the model's generated text
-    cache_path.parent.mkdir(parents=True, exist_ok=True) # Create cache directory if needed
-    cache_path.write_text(code) # Save generated code to the cache file
+    last_err = "unknown"
+    for attempt in range(max_attempts):
+        prompt = base_prompt
+        if attempt > 0:
+            # feed the previous failure back so the model can correct it
+            prompt += (
+                f"\n\n## Your previous attempt failed\n"
+                f"It raised: {last_err}\n"
+                f"Return a corrected, complete `{fn_name}` definition that runs "
+                f"without error on the given observation/action spaces. Output ONLY "
+                f"the function definition, no markdown fences."
+            )
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2 + 0.2 * attempt,  # add diversity on retries
+        )
+        code = _strip_fences(resp.choices[0].message.content or "")
+        fn, err = _compile_and_validate(code, fn_name, validate)
+        if fn is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(code)
+            return code, fn
+        last_err = err
+        print(f"  ⚠ generated {prompt_name} fn invalid (attempt {attempt + 1}/"
+              f"{max_attempts}): {err}")
 
-    return code, _exec_fn(code, fn_name)
+    raise RuntimeError(
+        f"Could not generate a valid `{fn_name}` for {env_desc['env_id']} after "
+        f"{max_attempts} attempts. Last error: {last_err}"
+    )
 
 
 def cache_key(env: gym.Env, task: str) -> str:
@@ -123,7 +174,15 @@ def generate_reward_fn(
     model: str = "gpt-4o-mini",
 ) -> Tuple[str, Callable]:
     env_desc = describe_env(env, task_description)
-    return _generate_code("reward", "reward", env_desc, task_description, model)
+
+    def _validate(fn) -> bool:
+        obs = env.observation_space.sample()
+        action = env.action_space.sample()
+        out = fn(obs, action, obs)
+        vals = out.values() if isinstance(out, dict) else [out]
+        return all(np.isfinite(float(v)) for v in vals)
+
+    return _generate_code("reward", "reward", env_desc, task_description, model, validate=_validate)
 
 
 def generate_semantic_fn(
@@ -132,7 +191,16 @@ def generate_semantic_fn(
     model: str = "gpt-4o-mini",
 ) -> Tuple[str, Callable]:
     env_desc = describe_env(env, task_description)
-    return _generate_code("semantic", "summarize", env_desc, task_description, model)
+
+    def _validate(fn) -> bool:
+        obs = env.observation_space.sample()
+        action = env.action_space.sample()
+        # a fake 2-step trajectory mirroring (obs, action, next_obs, r_comp, done)
+        step = (obs, action, obs, {"total": 0.0, "component_a": 0.1}, False)
+        out = fn([step, step])
+        return isinstance(out, str) and len(out) > 0
+
+    return _generate_code("semantic", "summarize", env_desc, task_description, model, validate=_validate)
 
 
 def compare_trajectories(

@@ -1,0 +1,20 @@
+Make the swimmer move to the right (positive x) through the viscous fluid as fast as possible, with smooth, low-energy actuation of its two joints.
+
+Observation layout (8 dims):
+- obs[0]: angle of the front tip
+- obs[1]: angle of the first rotor (joint between links 1 and 2)
+- obs[2]: angle of the second rotor (joint between links 2 and 3)
+- obs[3]: forward (x-axis) velocity of the front tip — this is ALREADY a velocity
+- obs[4]: lateral (y-axis) velocity of the front tip
+- obs[5]: angular velocity of the front tip
+- obs[6]: angular velocity of the first rotor
+- obs[7]: angular velocity of the second rotor
+
+Action: 2 joint torques in [-1, 1].
+
+Task notes:
+- To reward forward speed use next_obs[3] directly; it is a velocity, so do NOT
+  difference it across steps.
+- The episode always runs for the full horizon (no early termination), so progress
+  is driven entirely by sustained forward velocity. Penalise large control torques
+  (energy) so the swimmer learns an efficient undulating gait rather than thrashing.
