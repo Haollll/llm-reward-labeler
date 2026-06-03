@@ -1,16 +1,14 @@
-def reward(obs, action, next_obs) -> dict:
-    temp_action = 0.5
-    temp_stability = 0.1
-    temp_speed = 0.1
-
-    forward_speed = next_obs[8]  # Reward for forward speed
-    action_cost = -np.clip(np.exp(-np.sum(action ** 2) / temp_action), 0, 1)  # Penalty for high torque usage
-    stability_penalty = -np.clip(np.exp((np.abs(obs[1]) + np.sum(np.abs(obs[2:8]))) / temp_stability), 0, 1)  # Penalty for body angle and joint angles
-
-    total = forward_speed + action_cost + stability_penalty
+def reward(obs, action, next_obs):
+    forward_speed = float(next_obs[8])  # reward for forward speed
+    action_cost = -0.05 * float(np.sum(np.square(action)))  # reduced effort penalty
+    stability = -0.3 * float(np.abs(obs[1]))  # reduced penalty for body angle deviation
+    joint_velocity_penalty = -0.02 * float(np.sum(np.square(next_obs[11:17])))  # reduced penalty for joint velocities
+    
+    total = forward_speed + action_cost + stability + joint_velocity_penalty
     return {
-        'total': total,
-        'forward_speed': forward_speed,
-        'action_cost': action_cost,
-        'stability_penalty': stability_penalty
+        "total": total,
+        "forward_speed": forward_speed,
+        "action_cost": action_cost,
+        "stability": stability,
+        "joint_velocity_penalty": joint_velocity_penalty
     }

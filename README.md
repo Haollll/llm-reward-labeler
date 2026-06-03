@@ -1,185 +1,106 @@
-# LLM Reward Labeler
+# LLM Reward Labeler v2 — Two-Phase Bradley-Terry Reward Learning
 
-A system that trains RL agents without access to ground-truth rewards by using LLMs as drop-in replacements for human annotators in RLHF-style reward learning, across multiple MuJoCo environments.
+A rebuild of the LLM-reward-labeler idea around an explicit **two-phase**
+algorithm. An LLM writes a coded reward function and a trajectory summarizer; the
+summarizer feeds an LLM preference labeler that trains a single Bradley-Terry
+(BT) reward model over **full trajectories**. PPO is bootstrapped on the coded
+reward, then trained on a fixed blend of the coded reward and the learned BT
+reward.
 
----
+This version deliberately **drops** three mechanisms from v1 that complicated
+analysis: the ensemble reward model, active/disagreement query selection, and
+fixed-length trajectory segments. It also fixes two v1 failure modes: it keeps a
+**constant** Phase-II mixing weight (v1 decayed it to ~0 and collapsed onto a
+noisy learned reward) and **saves the best-by-eval policy** (v1 saved the last,
+which was usually the collapsed one).
 
-## Project Overview
+**Per-round, on-policy preference data.** Each round rolls out `num_trajs` fresh
+trajectories with the *current* policy and compares **all `C(num_trajs, 2)`
+pairs**. The BT buffer is **reset every round**, so the reward model is trained
+only on this round's on-policy pairs (full-batch); old pairs from a different
+policy are discarded.
 
-Standard RLHF requires human annotators to compare trajectory pairs and label preferences. This project replaces that human-in-the-loop with an LLM pipeline:
+**PPO hyperparameters come from RL-Zoo3.** `ppo_agent.py` loads each env's tuned
+PPO config (learning rate, `n_steps`, `batch_size`, `n_epochs`, `gamma`,
+`gae_lambda`, `clip_range`, `ent_coef`, `vf_coef`, `max_grad_norm`,
+`policy_kwargs`, `use_sde`), its `n_envs`, and its VecNormalize setting — the
+same hyperparameters the baselines were trained with. The coded/BT reward sits
+*under* VecNormalize so it always sees raw observations; the policy sees
+normalized observations, and eval/collection re-apply the saved obs stats.
 
-1. **LLM-generated reward function** — given the environment source code, an LLM writes a fixed reward function `r_fixed` capturing the task objective
-2. **LLM-generated semantic layer** — an LLM writes a function that translates raw trajectories (states, actions) into natural language descriptions
-3. **LLM preference labeler** — an LLM compares pairs of trajectory descriptions and returns a preference label, replacing human annotators
-4. **Bradley-Terry ensemble reward model** — a learned reward model `R_phi` (ensemble of 3 networks) is trained on these LLM-generated labels
-5. **Combined reward signal** — `r_total = alpha * r_fixed + (1 - alpha) * normalise(R_phi)`, where `alpha` decays across training rounds
-6. **Active learning** — candidate trajectories are ranked by ensemble disagreement; only the most informative pairs are queried, maximizing label efficiency
-7. **Reflection** — after each evaluation round, the LLM inspects the round-over-round training dynamics and may rewrite `r_fixed` and the trajectory summarizer (EUREKA-style)
-
-The agent is PPO (stable-baselines3). The pipeline is compared against **RL-Zoo3-trained PPO baselines** on the true environment reward.
-
-### Supported environments
-
-`Pendulum-v1`, `Swimmer-v4`, `HalfCheetah-v4`, `Hopper-v4`, `Walker2d-v4`, `Ant-v4` — each the most up-to-date version RL-Zoo3 ships tuned PPO hyperparameters for.
-
-> The MuJoCo v4 envs are flagged "out of date" by gymnasium; we silence that warning in `helper.silence_env_warnings()`.
-
----
-
-## File Structure
-
-```
-.
-├── train.py              # Single-env entry point, argparse
-├── train_all.py          # Train pipeline across several envs in sequence
-├── train_baselines.py    # Train PPO baselines via RL-Zoo3 for the supported envs
-├── evaluate.py           # Pipeline policy vs RL-Zoo3 baseline (true env reward), saves PDF
-├── baseline.py           # Load an RL-Zoo3-trained PPO baseline + evaluate on true reward
-├── make_plots.py         # CLI: per-env + cross-env PDF plots
-├── plots.py              # Plotting functions (read JSON artifacts)
-├── paths.py              # Env-first artifact layout helpers
-├── trainer.py            # Trainer, TrainerConfig, main training loop, metrics.json
-├── ppo_agent.py          # PPOAgent wrapping stable-baselines3 PPO
-├── sampler.py            # Trajectory collection, LLM labelling, active learning
-├── reward.py             # CompositeReward (alpha * r_fixed + (1-alpha) * R_phi)
-├── reward_model.py       # EnsembleRewardModel, PreferenceBuffer, traj_to_segment
-├── env_setup.py          # CustomRewardWrapper, eval_with_components, collect_trajectory
-├── llm_utils.py          # LLM code generation (reward fn, semantic layer, comparison), caching
-├── llm_reflection.py     # ReflectionEngine + reflection_log.json
-├── helper.py             # Task loading, env→task map, success criteria, warning suppression
-├── prompts/              # reward.md, semantic.md, compare.md, reflection.md
-└── tasks/                # pendulum, swimmer, halfcheetah, hopper, walker2d, ant
-```
-
----
-
-## Installation
-
-```bash
-conda env create -f environment.yml   # includes rl_zoo3 (baseline training)
-conda activate llm-reward
-# Torch must be installed manually (see comment in environment.yml), e.g. CPU:
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-```
-
-Set your OpenAI key in a `.env` file:
+## Algorithm
 
 ```
-OPENAI_API_KEY=sk-...
+Initialize r_fixed, summary_fn (LLM-generated), BT reward model r_model
+
+Phase I  (k1 rounds):           # coded reward + reflection
+  PPO(policy, reward=r_fixed, steps=N)
+  trajs    = rollout(policy)                      # full episodes
+  r_fixed, summary_fn = llm_reflection(summaries(trajs))
+  trajs    = relabel_reward_components(trajs, r_fixed)
+  labels   = llm_trajectory_comparisons(summaries(trajs, summary_fn))
+  BT_train(r_model, labels)                       # cross-entropy over summed rewards
+
+Phase II (k2 rounds):           # mixed reward, no reflection
+  reward = alpha * r_fixed + (1 - alpha) * r_model
+  PPO(policy, reward=reward, steps=N)
+  trajs  = rollout(policy)
+  labels = llm_trajectory_comparisons(summaries(trajs, summary_fn))
+  BT_train(r_model, labels)
 ```
 
----
+## Files
+
+| File | Role |
+|------|------|
+| `llm.py` | env description, LLM code-gen (reward + summarizer), preference comparison, Phase-I reflection |
+| `reward_model.py` | single-network BT model over full (padded+masked) trajectories; per-epoch loss; normalized predict |
+| `reward_fn.py` | `CompositeReward` = `alpha*r_fixed + (1-alpha)*R_phi` (constant alpha) |
+| `env_utils.py` | reward wrapper, full-episode collection, component relabel, 100-ep evaluation |
+| `zoo_hyperparams.py` | load + translate RL-Zoo3's tuned PPO hyperparameters for an env |
+| `ppo_agent.py` | stable-baselines3 PPO wrapper (uses zoo hyperparameters + VecNormalize) |
+| `trainer.py` | the two-phase loop + best-policy saving + metrics dump |
+| `train.py` / `train_all.py` | single-env / multi-env entry points |
+| `baseline.py` | load + evaluate the reused RL-Zoo3 PPO baselines |
+| `evaluate.py` | 100-ep pipeline eval, baseline eval, single-episode BT-vs-env series |
+| `plots.py` / `make_plots.py` | the four result plots |
+| `prompts/` | `reward.md`, `semantic.md`, `compare.md`, `reflection.md` |
+| `tasks/` | per-env observation-layout descriptions (shared with v1) |
+| `baselines/` | symlink to v1's RL-Zoo3 baselines (no retraining) |
 
 ## Usage
 
 ```bash
-# Train one env (task auto-selected from the env via helper.task_for_env)
-python train.py --env HalfCheetah-v4 --rounds 9 --queries 10 --ppo-steps 50000 \
-    --reward-epochs 50 --lambda-smooth 0.05 --dynamic-batch
-
-# Train the pipeline on all six envs in sequence (each writes to artifacts/<env_id>/...)
-python train_all.py --rounds 9 --ppo-steps 50000 --lambda-smooth 0.05 --dynamic-batch
-
-# Train the PPO baselines via RL-Zoo3 (saves to baselines/ppo/<env>_<run>/)
-python train_baselines.py                                 # all six envs, tuned budgets
-python train_baselines.py --envs HalfCheetah-v4           # a subset
-
-# Evaluate a trained baseline on the true env reward
-python baseline.py --env HalfCheetah-v4 --episodes 100
-
-# Evaluate the trained pipeline policy vs the RL-Zoo3 baseline (saves a PDF)
+# one env
+python train.py --env HalfCheetah-v4 --k1 5 --k2 4 --ppo-steps 100000
 python evaluate.py --env HalfCheetah-v4
+python make_plots.py --env HalfCheetah-v4
 
-# Generate the plot suite (PDFs)
-python make_plots.py --env HalfCheetah-v4                 # per-env plots
-python make_plots.py --cross-env                          # cross-env bars (all envs)
+# everything (6 envs, train → eval → plot)
+./run_experiment.sh
 ```
 
-| Argument (`train.py`) | Default | Description |
-|---|---|---|
-| `--env` | `HalfCheetah-v4` | Environment id |
-| `--task` | (auto) | Task file name; defaults to the env's task |
-| `--rounds` | 9 | Number of active learning rounds |
-| `--queries` | 10 | Preference queries per round |
-| `--ppo-steps` | auto | PPO steps per round; default = rl-zoo3 total timesteps for the env ÷ (rounds + 1) |
-| `--reward-epochs` | 50 | Reward model training epochs per round |
-| `--lambda-smooth` | 1.0 | Temporal smoothness penalty (use `0.05`, see notes) |
-| `--dynamic-batch` | off | Scale batch size with buffer size |
+Requires `OPENAI_API_KEY` in `.env`. Install deps from `environment.yml` (then
+install torch separately, see the file's footer).
 
----
+## Plots (per env, under `artifacts/<env>/plots/`)
 
-## Artifact layout (env-first)
+1. **`training_phases.pdf`** — mean 100-episode return per round, Phase I and II
+   on one axis with a dashed vertical line at the phase boundary.
+2. **`bt_loss_per_epoch.pdf`** — BT cross-entropy loss at every epoch of every
+   round, concatenated across both phases (≈ `epochs × rounds` points), with
+   round guides and the phase boundary marked.
+3. **`bt_vs_env.pdf`** — per-timestep BT model reward vs true env reward for a
+   single baseline-policy episode (twin y-axes; Pearson r in the title).
+4. **`eval_metrics_bars.pdf`** — 100-episode mean return, mean episode length,
+   and success rate (when applicable), pipeline vs baseline.
 
-Everything an env produces lives under one directory:
+## Data artifacts (per env)
 
-```
-artifacts/<env_id>/
-    policies/policy.zip
-    reward_models/{member*.pt, metadata.pt}
-    baseline/metrics.json          # RL-Zoo3 baseline returns/lengths (from evaluate.py / baseline.py)
-    eval.json                      # evaluate.py's pipeline eval (drives the cross-env plot)
-    reflection/{reflection_log.json, reward_round<r>.py, semantic_round<r>.py}
-    metrics.json                   # full run config + per-round train/eval data
-                                   #   (mean+std+raw per-episode arrays, components,
-                                   #    reward-model losses) — everything the plots
-                                   #    read, so aesthetics can be re-derived offline
-    plots/*.pdf
-artifacts/cross_env/*.pdf          # cross-env comparison bars
-baselines/ppo/<env_id>_<run>/      # RL-Zoo3 trained baseline (model + VecNormalize)
-```
-
----
-
-## Plots
-
-All plots are saved as **PDF** with clean labels. Per env (`make_plots.py --env <id>`):
-
-- **episode_return_per_round** — eval episodic return (true env reward) vs round (one aggregated point per eval round)
-- **reward_model_loss** — CE / smooth / total reward-model loss per round (averaged over that round's epochs)
-- **reward_components** — per-component reward sums (mean over eval episodes) across rounds
-
-Cross-env (`make_plots.py --cross-env`): a **single figure** (`artifacts/cross_env/cross_env_comparison.pdf`) with the three metrics as stacked panels sharing the env axis — mean episodic return, mean episode length, and success rate (panel shown only where applicable) — pipeline vs RL-Zoo3 baseline. The numbers come from **`evaluate.py`'s** evaluation: the pipeline bars read each env's `eval.json` and the baseline bars read `baseline/metrics.json`, so **run `python evaluate.py --env <id>` for each env first** (it writes both).
-
-The reflection edit history is **logged** (not plotted): `reflection/reflection_log.json` records, per round, the analysis, reasoning, and whether `r_fixed` / the summarizer were rewritten; each accepted rewrite is also saved as `reward_round<r>.py` / `semantic_round<r>.py`.
-
----
-
-## Baselines (RL-Zoo3)
-
-We compare against PPO baselines trained with [RL Baselines3 Zoo](https://github.com/DLR-RM/rl-baselines3-zoo), which ships tuned PPO hyperparameters per env and saves the model **together with its VecNormalize statistics** — so baselines reload faithfully (no warmup hacks).
-
-```bash
-python train_baselines.py                       # train all six (tuned budgets)
-python train_baselines.py --envs HalfCheetah-v4 --n-timesteps 1000000
-python baseline.py --env HalfCheetah-v4          # evaluate on true env reward
-```
-
-Trained baselines land in `baselines/ppo/<env_id>_<run>/`. `baseline.py` loads the model + frozen VecNormalize stats and evaluates on the **raw** environment reward (`norm_reward=False`), caching to `artifacts/<env>/baseline/metrics.json` for the plots and `evaluate.py`.
-
----
-
-## Key Design Decisions
-
-- **LLM as preference labeler** — replaces human annotators; the LLM sees natural-language trajectory descriptions and picks the preferred one
-- **Ensemble reward model (×3)** — three independent networks; ensemble variance estimates label uncertainty
-- **Active learning** — collect 5× candidate pairs per round, query only the top-`n` by disagreement (cold start uses uniform sampling)
-- **Reflection** — after each eval, the LLM may rewrite `r_fixed`/summarizer; accepted reward rewrites trigger a buffer relabel so the BT model stays consistent
-- **`lambda_smooth=0.05`** — keep the temporal smoothness penalty small (see notes)
-- **Explicit obs layout in task description** — each `tasks/*.txt` annotates observation dimensions (e.g. "obs[8] is forward velocity, not position"); without this the LLM can generate a reward function anti-correlated with the true objective
-
----
-
-## Notes
-
-**`lambda_smooth`.** The original default `1.0` was too large: the smoothness penalty grew as fast as the CE loss improved, so total loss looked flat (`≈ 3 × ln(2) ≈ 2.08`) while the model was actually learning. With `lambda_smooth=0.05` the CE improvement shows through. `reward_model.train()` returns `(ce_loss, smooth_loss)` separately so both are monitored.
-
-**Obs-layout misreads.** LLMs routinely misinterpret MuJoCo observation vectors (position vs velocity vs angle) because the XML variable names are terse. The annotated obs layout in each task file is a simple, high-leverage fix; alternatively the reflection mechanism can detect and correct a misaligned reward at runtime.
-
----
-
-## References
-
-- Christiano et al. (2017). [Deep Reinforcement Learning from Human Preferences.](https://arxiv.org/abs/1706.03741) NeurIPS 2017.
-- Lee et al. (2021). PEBBLE: Feedback-Efficient Interactive Reinforcement Learning via Relabeling Experience and Unlabeled Data. ICML 2021. *(ensemble reward model design)*
-- Ma et al. (2023). EUREKA: Human-Level Reward Design via Coding Large Language Models. *(LLM-as-reward-designer + reflection inspiration)*
-- [RL Baselines3 Zoo](https://github.com/DLR-RM/rl-baselines3-zoo) — tuned PPO hyperparameters and training framework used for the baselines.
+* `metrics.json` — per-round records: phase, alpha, mean/std return, episode
+  length, component means, **per-epoch BT loss list**, BT accuracy, buffer size.
+* `eval.json` — 100-episode pipeline evaluation (return/length/success arrays).
+* `baseline/metrics.json` — RL-Zoo3 baseline evaluation.
+* `bt_vs_env.json` — per-step env reward + BT reward for one episode.
+* `reflection/` — per-round reflection log + versioned `reward_round*.py` /
+  `semantic_round*.py` rewrites.

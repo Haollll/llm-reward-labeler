@@ -1,23 +1,32 @@
-"""Plotting suite for the LLM-reward pipeline. Every function reads the JSON
-artifacts written during training (artifacts/<env>/metrics.json,
-reflection/reflection_log.json, baseline/metrics.json) and saves a single,
-cleanly-labelled figure as a PDF under artifacts/<env>/plots/.
+"""Plotting suite for v2. Each function reads the JSON artifacts written during
+training / evaluation and saves one PDF under artifacts/<env>/plots/.
 
-Driven by make_plots.py; importable directly too.
+Plots:
+  1. training_phases.pdf      — avg 100-ep return per round, Phase I & II on one
+                                axis with a vertical line at the phase boundary.
+  2. bt_loss_per_epoch.pdf    — BT reward-model loss at every epoch of every round
+                                across both phases (one continuous time series).
+  3. bt_vs_env.pdf            — per-step BT reward vs true env reward for a single
+                                baseline-policy episode (twin y-axes).
+  4. eval_metrics_bars.pdf    — 100-ep mean return / length / success-rate bars,
+                                pipeline vs RL-Zoo3 baseline.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from paths import metrics_path, baseline_metrics_path, eval_metrics_path, plots_dir
+from paths import (
+    metrics_path, baseline_metrics_path, eval_metrics_path,
+    bt_vs_env_path, plots_dir,
+)
 
 plt.rcParams.update({
     "figure.autolayout": True,
@@ -27,19 +36,13 @@ plt.rcParams.update({
     "axes.labelsize": 11,
 })
 
-
-# ── loaders ───────────────────────────────────────────────────────────────────
-
-def load_metrics(env_id: str, artifact_dir: str = "artifacts") -> dict:
-    p = metrics_path(env_id, artifact_dir)
-    if not p.exists():
-        raise FileNotFoundError(f"No metrics at {p} (train {env_id} first)")
-    return json.loads(p.read_text())
+PIPE_C = "#4C72B0"
+BASE_C = "#DD8452"
+BT_C = "#55A868"
 
 
-def load_baseline(env_id: str, artifact_dir: str = "artifacts") -> Optional[dict]:
-    p = baseline_metrics_path(env_id, artifact_dir)
-    return json.loads(p.read_text()) if p.exists() else None
+def _load(path: Path) -> Optional[dict]:
+    return json.loads(path.read_text()) if path.exists() else None
 
 
 def _save(fig_path: Path) -> Path:
@@ -49,62 +52,151 @@ def _save(fig_path: Path) -> Path:
     return fig_path
 
 
-# ── per-env plots ───────────────────────────────────────────────────────────
+# ── 1. training returns across phases ─────────────────────────────────────────
 
-def plot_episode_return_per_round(env_id: str, artifact_dir: str = "artifacts") -> Path:
-    """Eval episodic return (true env reward) vs training round."""
-    m = load_metrics(env_id, artifact_dir)
-    ev = m["eval"]
-    rounds = [e["round"] for e in ev]
-    rets = [e["episode_env_reward"] for e in ev]
-    plt.figure(figsize=(7, 4.5))
-    plt.plot(rounds, rets, marker="o", color="#4C72B0")
-    plt.xlabel("Training round")
-    plt.ylabel("Mean episodic return (true env reward)")
-    plt.title(f"{env_id}: episodic return per round")
-    return _save(plots_dir(env_id, artifact_dir) / "episode_return_per_round.pdf")
+def plot_training_phases(env_id: str, artifact_dir: str = "artifacts") -> Path:
+    m = _load(metrics_path(env_id, artifact_dir))
+    if m is None:
+        raise FileNotFoundError(f"No metrics for {env_id} (train it first)")
+    rounds = m["rounds"]
+    x = [r["global_round"] for r in rounds]
+    y = [r["episode_env_reward"] for r in rounds]
+    err = [r.get("episode_env_reward_std", 0.0) for r in rounds]
+    k1 = m["k1"]
 
-
-def plot_reward_model_loss(env_id: str, artifact_dir: str = "artifacts") -> Path:
-    """Reward-model CE / smooth / total loss across training steps."""
-    m = load_metrics(env_id, artifact_dir)
-    rm = m["reward_model"]
-    x = list(range(len(rm)))
-    labels = [r["round"] for r in rm]
-    plt.figure(figsize=(7, 4.5))
-    plt.plot(x, [r["ce"] for r in rm], marker="o", label="CE loss")
-    plt.plot(x, [r["smooth"] for r in rm], marker="s", label="smooth (unscaled)")
-    plt.plot(x, [r["total"] for r in rm], marker="^", label="total")
-    plt.xticks(x, labels)
-    plt.xlabel("Reward-model training step (round)")
-    plt.ylabel("Loss")
-    plt.title(f"{env_id}: reward-model loss")
-    plt.legend()
-    return _save(plots_dir(env_id, artifact_dir) / "reward_model_loss.pdf")
+    plt.figure(figsize=(8, 4.8))
+    plt.errorbar(x, y, yerr=err, marker="o", capsize=3, color=PIPE_C,
+                 label="Mean 100-ep return")
+    # vertical line between the last Phase-I round and the first Phase-II round
+    boundary = k1 + 0.5
+    plt.axvline(boundary, color="black", linestyle="--", linewidth=1.2)
+    ymin, ymax = plt.ylim()
+    plt.text(boundary - 0.1, ymax, "Phase I", ha="right", va="top", fontsize=10)
+    plt.text(boundary + 0.1, ymax, "Phase II", ha="left", va="top", fontsize=10)
+    plt.xlabel("Training round (global)")
+    plt.ylabel("Mean episodic return (true env reward, 100 ep)")
+    plt.title(f"{env_id}: episodic return per round (Phase I → II)")
+    plt.legend(loc="lower right")
+    return _save(plots_dir(env_id, artifact_dir) / "training_phases.pdf")
 
 
-def plot_component_contributions(env_id: str, artifact_dir: str = "artifacts") -> Path:
-    """Stacked per-component reward sums across rounds (how the reward is assembled)."""
-    m = load_metrics(env_id, artifact_dir)
-    ev = m["eval"]
-    rounds = [e["round"] for e in ev]
-    names = sorted({k for e in ev for k in e.get("component_means", {})})
-    plt.figure(figsize=(7.5, 4.5))
-    for name in names:
-        series = [e.get("component_means", {}).get(name, 0.0) for e in ev]
-        plt.plot(rounds, series, marker="o", label=name)
-    plt.xlabel("Training round")
-    plt.ylabel("Mean per-trajectory component sum")
-    plt.title(f"{env_id}: reward components across rounds")
-    if names:
-        plt.legend(fontsize=8)
-    return _save(plots_dir(env_id, artifact_dir) / "reward_components.pdf")
+# ── 2. BT loss at every epoch of every round ──────────────────────────────────
+
+def plot_bt_loss_per_epoch(env_id: str, artifact_dir: str = "artifacts") -> Path:
+    m = _load(metrics_path(env_id, artifact_dir))
+    if m is None:
+        raise FileNotFoundError(f"No metrics for {env_id}")
+    rounds = m["rounds"]
+    k1 = m["k1"]
+
+    losses: List[float] = []
+    round_boundaries: List[int] = []   # x index where each round starts
+    phase2_start_x = None
+    for i, r in enumerate(rounds):
+        round_boundaries.append(len(losses))
+        if r["phase"] == "II" and phase2_start_x is None:
+            phase2_start_x = len(losses)
+        losses.extend(r.get("bt_loss_epochs", []))
+
+    x = list(range(len(losses)))
+    plt.figure(figsize=(9, 4.8))
+    plt.plot(x, losses, color=BT_C, linewidth=1.0, label="BT cross-entropy loss")
+    # light vertical guides at each round boundary
+    for i, b in enumerate(round_boundaries):
+        plt.axvline(b, color="grey", linestyle=":", linewidth=0.6, alpha=0.5)
+    if phase2_start_x is not None:
+        plt.axvline(phase2_start_x, color="black", linestyle="--", linewidth=1.2,
+                    label="Phase I → II")
+    plt.xlabel("BT training epoch (concatenated across rounds, both phases)")
+    plt.ylabel("Cross-entropy loss")
+    plt.title(f"{env_id}: BT reward-model loss per epoch "
+              f"({len(rounds)} rounds × {m.get('reward_epochs', '?')} epochs)")
+    plt.legend(loc="upper right")
+    return _save(plots_dir(env_id, artifact_dir) / "bt_loss_per_epoch.pdf")
+
+
+# ── 3. BT reward vs true env reward per timestep (single episode) ─────────────
+
+def plot_bt_vs_env(env_id: str, artifact_dir: str = "artifacts") -> Path:
+    d = _load(bt_vs_env_path(env_id, artifact_dir))
+    if d is None:
+        raise FileNotFoundError(f"No bt_vs_env data for {env_id} (run evaluate.py)")
+    env_r = d["env_reward"]
+    bt_r = d["bt_reward"]
+    t = list(range(len(env_r)))
+
+    fig, ax1 = plt.subplots(figsize=(9, 4.8))
+    ax2 = ax1.twinx()
+    l1, = ax1.plot(t, env_r, color=BASE_C, linewidth=1.0, label="True env reward")
+    l2, = ax2.plot(t, bt_r, color=BT_C, linewidth=1.0, label="BT model reward")
+    ax1.set_xlabel("Timestep (single baseline-policy episode)")
+    ax1.set_ylabel("True env reward / step", color=BASE_C)
+    ax2.set_ylabel("BT model reward / step", color=BT_C)
+    ax1.tick_params(axis="y", labelcolor=BASE_C)
+    ax2.tick_params(axis="y", labelcolor=BT_C)
+    ax2.grid(False)
+    # Pearson correlation as a quick alignment summary
+    if len(env_r) > 1 and np.std(env_r) > 0 and np.std(bt_r) > 0:
+        corr = float(np.corrcoef(env_r, bt_r)[0, 1])
+        title = f"{env_id}: BT reward vs true env reward per step (Pearson r={corr:.2f})"
+    else:
+        title = f"{env_id}: BT reward vs true env reward per step"
+    ax1.set_title(title)
+    ax1.legend(handles=[l1, l2], loc="upper right")
+    return _save(plots_dir(env_id, artifact_dir) / "bt_vs_env.pdf")
+
+
+# ── 4. eval metric bars (pipeline vs baseline) ────────────────────────────────
+
+def plot_eval_metrics_bars(env_id: str, artifact_dir: str = "artifacts") -> Path:
+    pipe = _load(eval_metrics_path(env_id, artifact_dir))
+    if pipe is None:
+        raise FileNotFoundError(f"No eval.json for {env_id} (run evaluate.py)")
+    base = _load(baseline_metrics_path(env_id, artifact_dir))
+
+    def _succ(d):
+        if d is None:
+            return None
+        if "success_rate" in d:
+            return d["success_rate"]
+        s = d.get("success")
+        return float(np.mean(s)) if s else None
+
+    pipe_succ = _succ(pipe)
+    base_succ = _succ(base)
+    has_success = pipe_succ is not None or base_succ is not None
+
+    panels = [
+        ("Mean episodic return", pipe["mean_return"],
+         base["mean_return"] if base else np.nan, "%.0f", None),
+        ("Mean episode length", pipe["mean_length"],
+         base["mean_length"] if base else np.nan, "%.0f", None),
+    ]
+    if has_success:
+        panels.append(("Success rate",
+                       pipe_succ if pipe_succ is not None else np.nan,
+                       base_succ if base_succ is not None else np.nan,
+                       "%.2f", (0, 1.05)))
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(4.2 * len(panels), 4.4))
+    if len(panels) == 1:
+        axes = [axes]
+    for ax, (title, pv, bv, fmt, ylim) in zip(axes, panels):
+        bars = ax.bar(["Pipeline", "Baseline"], [pv, bv], color=[PIPE_C, BASE_C])
+        ax.bar_label(bars, fmt=fmt, padding=3)
+        ax.set_title(title)
+        if ylim:
+            ax.set_ylim(*ylim)
+    fig.suptitle(f"{env_id}: pipeline vs RL-Zoo3 baseline "
+                 f"({pipe['n_episodes']} episodes)", fontsize=13)
+    return _save(plots_dir(env_id, artifact_dir) / "eval_metrics_bars.pdf")
 
 
 PER_ENV_PLOTS = [
-    plot_episode_return_per_round,
-    plot_reward_model_loss,
-    plot_component_contributions,
+    plot_training_phases,
+    plot_bt_loss_per_epoch,
+    plot_bt_vs_env,
+    plot_eval_metrics_bars,
 ]
 
 
@@ -116,92 +208,3 @@ def make_all_per_env(env_id: str, artifact_dir: str = "artifacts") -> List[Path]
         except Exception as e:
             print(f"  [skip {fn.__name__}] {type(e).__name__}: {e}")
     return out
-
-
-# ── cross-env plots ───────────────────────────────────────────────────────────
-
-def _pipeline_summary(env_id: str, artifact_dir: str):
-    """Pipeline return/length/success from evaluate.py's eval.json (the dedicated
-    evaluation of the trained policy). Returns None if it hasn't been run yet."""
-    p = eval_metrics_path(env_id, artifact_dir)
-    if not p.exists():
-        return None
-    d = json.loads(p.read_text())
-    return {
-        "return":  d["mean_return"],
-        "length":  d["mean_length"],
-        "success": d.get("success_rate"),
-    }
-
-
-def plot_cross_env_bars(
-    env_ids: List[str],
-    artifact_dir: str = "artifacts",
-    out_dir: str = "artifacts/cross_env",
-) -> List[Path]:
-    """Single figure with the three cross-env metrics as stacked panels (sharing
-    the env axis): mean episodic return, mean episode length, and success rate
-    (panel shown only if at least one env reports it). Pipeline vs RL-Zoo3 PPO
-    baseline. Returns a one-element list with the saved PDF path.
-
-    The metrics live on very different scales (return in thousands, length in
-    hundreds, success in [0,1]), so they get their own y-axis panels rather than
-    being forced onto one axis."""
-    pipe = {e: _pipeline_summary(e, artifact_dir) for e in env_ids}
-    base = {e: load_baseline(e, artifact_dir) for e in env_ids}
-    envs = [e for e in env_ids if pipe.get(e) is not None]
-    if not envs:
-        raise RuntimeError(
-            "No eval.json found for any requested env. Run evaluate.py per env "
-            "first (e.g. `python evaluate.py --env HalfCheetah-v4`) so the cross-env "
-            "plot has pipeline eval data."
-        )
-
-    # panels to draw: (metric key, baseline accessor, y-label, bar fmt, ylim)
-    panels = [
-        ("return", lambda b: b["mean_return"],
-         "Episodic return", "%.0f", None),
-        ("length", lambda b: b["mean_length"],
-         "Episode length", "%.0f", None),
-    ]
-    if any(pipe[e]["success"] is not None for e in envs):
-        panels.append(
-            ("success", lambda b: float(np.mean(b["success"])) if b.get("success") else np.nan,
-             "Success rate", "%.2f", (0, 1.05))
-        )
-
-    x = np.arange(len(envs))
-    w = 0.38
-    fig, axes = plt.subplots(
-        len(panels), 1, sharex=True,
-        figsize=(max(7, 1.5 * len(envs)), 2.6 * len(panels) + 0.6),
-    )
-    if len(panels) == 1:
-        axes = [axes]
-
-    for ax, (metric, base_get, ylabel, fmt, ylim) in zip(axes, panels):
-        pvals = [pipe[e][metric] if pipe[e][metric] is not None else np.nan for e in envs]
-        bvals = [base_get(base[e]) if base.get(e) else np.nan for e in envs]
-        b1 = ax.bar(x - w / 2, pvals, w, label="Pipeline (LLM reward)", color="#4C72B0")
-        b2 = ax.bar(x + w / 2, bvals, w, label="RL-Zoo3 PPO baseline", color="#DD8452")
-        ax.bar_label(b1, fmt=fmt, padding=2, fontsize=8)
-        ax.bar_label(b2, fmt=fmt, padding=2, fontsize=8)
-        ax.set_ylabel(ylabel)
-        if ylim:
-            ax.set_ylim(*ylim)
-
-    axes[-1].set_xticks(x)
-    axes[-1].set_xticklabels(envs, rotation=20, ha="right")
-    axes[0].set_title("Pipeline vs RL-Zoo3 PPO baseline across environments")
-    # one shared legend at the top
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper right", ncol=2, fontsize=9,
-               bbox_to_anchor=(1.0, 1.0))
-
-    out = Path(out_dir) / "cross_env_comparison.pdf"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(out)
-    plt.close(fig)
-    out_paths = [out]
-
-    return out_paths

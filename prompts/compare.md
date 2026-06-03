@@ -1,7 +1,7 @@
 # Trajectory preference comparison
 
-You are comparing two trajectories from a Gymnasium environment to express a
-preference for Bradley-Terry preference learning.
+You are comparing two full-episode trajectories from a Gymnasium environment to
+express a preference used as a Bradley-Terry training label.
 
 **Task description:** {task}
 
@@ -13,59 +13,50 @@ preference for Bradley-Terry preference learning.
 
 {summary_b}
 
-## What you are actually deciding
+## What you are deciding
 
-You are answering one question:
+Answer one question:
 
 > Which trajectory — A or B — achieves the **task** above more successfully?
 
 Task achievement is a judgement about behaviour, not a comparison of scalar
-totals. The summaries you are given **deliberately omit total reward** so that
-this judgement cannot collapse to "whichever number is bigger". Each summary
-contains two kinds of information:
+totals. The summaries **deliberately omit total reward** so the decision cannot
+collapse to "whichever number is bigger". Each summary gives you:
 
-1. **Behavioural features (decisive).** Reading the task description, decide
-   what "doing the task well" actually looks like. Then ask: which trajectory's
-   *behaviour* more closely matches that? Use the concrete behavioural features
-   in each summary (observation-derived stats, action stats, motion patterns,
-   progress markers, failure cues) to answer this.
-2. **Per-component reward breakdown.** Compare the two trajectories
-   **component-by-component**. For each named component, decide which
-   trajectory did better on that axis and whether that axis is task-relevant.
-   A trajectory winning on the components that matter to the task is preferable,
-   even if it loses on components that are less task-aligned.
+1. **Behavioural features (decisive).** From the task description, decide what
+   "doing the task well" looks like, then judge which trajectory's behaviour is
+   closer to that, using the concrete behavioural statistics in each summary.
+2. **Per-component reward breakdown.** Compare component-by-component; for each
+   named component decide which trajectory did better and whether that axis is
+   task-relevant. Winning on the components that matter to the task is what
+   counts.
 
 ### Hard rule
 
-The summaries do not contain a total reward and you must not attempt to
-reconstruct one (e.g. by summing the per-component values you see). A
-justification that invents or references a scalar "total" / "overall reward"
-is **not acceptable**. Reason about behaviour and individual components only.
+The summaries contain no total reward and you must not reconstruct one (e.g. by
+summing per-component values). A justification that invents or references a
+scalar "total" / "overall" / "sum" is **not acceptable**. Reason about behaviour
+and individual components only.
 
-### Required reasoning structure
+### Reasoning structure (work through before answering)
 
-Work through these in order before stating your preference:
+1. **Task achievement (A vs B).** What does success look like, and which
+   trajectory's behavioural features are closer to it — on which features?
+2. **Component-by-component (A vs B).** For each component, which trajectory was
+   better, and is that component task-relevant?
+3. **Tally.** Which trajectory wins on the *task-relevant* features and
+   components? That is your preference.
 
-1. **Task achievement (A vs B).** From the task description, what does success
-   look like? Which trajectory's behavioural features are closer to that — and
-   on which specific features?
-2. **Component-by-component comparison (A vs B).** For each reward component,
-   which trajectory scored better, and is that component task-relevant?
-3. **Tally.** Does A or B win on the *task-relevant* components and
-   behavioural features? That is your preference.
-
-Your justification must:
-- name at least one **specific behavioural feature** showing task achievement, AND
-- cite at least one **specific reward component** (by name) on which the
-  preferred trajectory either won or lost.
-- *not* reference a "total" / "overall" / "sum" of reward.
+Your justification must name at least one **specific behavioural feature** and
+cite at least one **specific reward component by name**, and must NOT reference a
+total / overall / summed reward.
 
 ## Required output
 
 Output a single JSON object with exactly two keys:
 
 ```json
-{{"preference": "A" or "B", "explanation": "<one to three sentences citing (a) a behavioural feature on which the preferred trajectory better achieves the task, and (b) at least one specific reward component by name; do NOT reference a 'total' / 'overall' / summed reward>"}}
+{{"preference": "A" or "B", "explanation": "<one to three sentences citing (a) a behavioural feature on which the preferred trajectory better achieves the task, and (b) at least one specific reward component by name; do NOT reference a 'total'/'overall'/summed reward>"}}
 ```
 
 No markdown fences, no extra commentary — just the JSON object.

@@ -1,34 +1,28 @@
 def reward(obs, action, next_obs):
-    forward_speed = float(next_obs[13])  # Reward for forward speed
-    height = float(obs[0])                # Current height of the torso
-    action_cost = -0.1 * float(np.sum(action ** 2))  # Penalty on control effort
-    lateral_drift_penalty = -0.5 * abs(float(obs[14]))  # Penalize lateral movement
-
-    # Healthy height range (example values, adjust as necessary)
-    healthy_height_min = 0.2
-    healthy_height_max = 1.0
-    height_penalty = 0.0
-    if height < healthy_height_min:
-        height_penalty = -2.0 * (healthy_height_min - height)  # Strong penalty for being too low
-    elif height > healthy_height_max:
-        height_penalty = -2.0 * (height - healthy_height_max)  # Strong penalty for being too high
-
-    # Normalize components to ensure they are comparable
-    temp_height = 1.0
-    temp_action = 1.0
-    temp_lateral = 1.0
-    temp_speed = 1.0
-
-    normalized_forward_speed = np.clip(np.exp(-forward_speed / temp_speed), 0, 1)
-    normalized_height_penalty = np.clip(np.exp(-height_penalty / temp_height), 0, 1)
-    normalized_action_cost = np.clip(np.exp(-action_cost / temp_action), 0, 1)
-    normalized_lateral_drift_penalty = np.clip(np.exp(-lateral_drift_penalty / temp_lateral), 0, 1)
-
-    total = normalized_forward_speed + normalized_height_penalty + normalized_action_cost + normalized_lateral_drift_penalty
+    # Reward for forward speed
+    forward_speed = next_obs[13]  # already a velocity
+    
+    # Penalize large control torques (energy)
+    action_cost = -0.01 * float(np.sum(np.square(action)))  # reduce effort penalty further
+    
+    # Stability term based on height and orientation
+    height = obs[0]
+    stability = 0.0
+    if 0.3 < height < 0.8:  # narrower healthy height range
+        stability += 1.0
+    else:
+        stability -= 2.0  # increase penalty if too low or too high
+    
+    # Penalize lateral drift
+    lateral_drift_penalty = -0.1 * abs(obs[14])  # further reduce penalty for lateral velocity
+    
+    # Total reward calculation
+    total = forward_speed + action_cost + stability + lateral_drift_penalty
+    
     return {
         "total": total,
-        "forward_speed": normalized_forward_speed,
-        "height_penalty": normalized_height_penalty,
-        "action_cost": normalized_action_cost,
-        "lateral_drift_penalty": normalized_lateral_drift_penalty
+        "forward_speed": forward_speed,
+        "action_cost": action_cost,
+        "stability": stability,
+        "lateral_drift_penalty": lateral_drift_penalty
     }

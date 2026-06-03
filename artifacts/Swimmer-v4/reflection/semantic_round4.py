@@ -1,50 +1,37 @@
-def summarize(trajectory) -> str:
+def summarize(trajectory):
     import numpy as np
     
     obs = np.array([t[0] for t in trajectory])
     actions = np.array([t[1] for t in trajectory])
     next_obs = np.array([t[2] for t in trajectory])
+    r_comp = [t[3] for t in trajectory]
     
     forward_velocities = next_obs[:, 3]
-    mean_forward_velocity = np.mean(forward_velocities)
+    avg_forward_velocity = np.mean(forward_velocities)
     std_forward_velocity = np.std(forward_velocities)
-    max_forward_velocity = np.max(forward_velocities)
-    min_forward_velocity = np.min(forward_velocities)
-
-    mean_angle_front_tip = np.mean(obs[:, 0])
-    mean_angle_first_rotor = np.mean(obs[:, 1])
-    mean_angle_second_rotor = np.mean(obs[:, 2])
     
-    mean_torque_first_rotor = np.mean(actions[:, 0])
-    mean_torque_second_rotor = np.mean(actions[:, 1])
+    energy_expended = np.sum(np.abs(actions))
+    avg_energy_per_step = np.mean(np.abs(actions))
     
-    mean_angular_velocity_front_tip = np.mean(obs[:, 5])
-    mean_angular_velocity_first_rotor = np.mean(obs[:, 6])
-    mean_angular_velocity_second_rotor = np.mean(obs[:, 7])
+    episode_length = len(trajectory)
     
-    reward_breakdown = {k: [] for k in trajectory[0][3].keys() if k != "total"}
+    summary = []
+    summary.append(f"Average forward velocity: {avg_forward_velocity:.2f}")
+    summary.append(f"Standard deviation of forward velocity: {std_forward_velocity:.2f}")
+    summary.append(f"Total energy expended: {energy_expended:.2f}")
+    summary.append(f"Average energy per step: {avg_energy_per_step:.2f}")
+    summary.append(f"Episode length: {episode_length}")
     
-    for step in trajectory:
-        for k in reward_breakdown.keys():
-            reward_breakdown[k].append(step[3][k])
+    for k in r_comp[0].keys():
+        if k == "total":
+            continue
+        component_values = [r[k] for r in r_comp]
+        mean_value = np.mean(component_values)
+        sum_value = np.sum(component_values)
+        summary.append(f"Mean {k}: {mean_value:.2f}, Sum {k}: {sum_value:.2f}")
     
-    summary_lines = []
-    summary_lines.append(f"Mean forward velocity: {mean_forward_velocity:.2f}, "
-                        f"Std: {std_forward_velocity:.2f}, "
-                        f"Max: {max_forward_velocity:.2f}, "
-                        f"Min: {min_forward_velocity:.2f}.")
-    summary_lines.append(f"Mean angle of front tip: {mean_angle_front_tip:.2f}.")
-    summary_lines.append(f"Mean angle of first rotor: {mean_angle_first_rotor:.2f}.")
-    summary_lines.append(f"Mean angle of second rotor: {mean_angle_second_rotor:.2f}.")
-    summary_lines.append(f"Mean torque of first rotor: {mean_torque_first_rotor:.2f}.")
-    summary_lines.append(f"Mean torque of second rotor: {mean_torque_second_rotor:.2f}.")
-    summary_lines.append(f"Mean angular velocity of front tip: {mean_angular_velocity_front_tip:.2f}.")
-    summary_lines.append(f"Mean angular velocity of first rotor: {mean_angular_velocity_first_rotor:.2f}.")
-    summary_lines.append(f"Mean angular velocity of second rotor: {mean_angular_velocity_second_rotor:.2f}.")
-
-    for k in reward_breakdown:
-        mean_reward = np.mean(reward_breakdown[k])
-        sum_reward = np.sum(reward_breakdown[k])
-        summary_lines.append(f"Mean {k} reward: {mean_reward:.2f}, Sum: {sum_reward:.2f}.")
+    # Add additional behavioral insights
+    avg_joint_angles = np.mean(np.abs(obs[:, 1:3]), axis=0)
+    summary.append(f"Average joint angles: {avg_joint_angles[0]:.2f}, {avg_joint_angles[1]:.2f}")
     
-    return "\n".join(summary_lines)
+    return "\n".join(summary)

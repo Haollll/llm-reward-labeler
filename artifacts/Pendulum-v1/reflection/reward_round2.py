@@ -1,18 +1,20 @@
 def reward(obs, action, next_obs):
-    theta = np.arctan2(obs[1], obs[0])  # Calculate the angle from cos and sin
-    theta_dot = obs[2]                   # Angular velocity
-    torque = action[0]                   # Torque applied
+    # Extract observations
+    cos_theta = obs[0]  # cos(theta)
+    sin_theta = obs[1]  # sin(theta)
+    theta_dot = obs[2]  # angular velocity
 
-    # Reward components
-    upright_reward = np.exp(-np.clip(theta ** 2, -20.0, 20.0))  # Reward for being upright (theta close to 0)
-    stability_penalty = -np.exp(-np.clip(theta_dot ** 2, -20.0, 20.0))  # Penalty for angular velocity (stability)
-    action_cost = -0.001 * (torque ** 2)  # Penalty for torque usage (energy cost)
+    # Calculate the reward components
+    stability = 10 * (cos_theta - 1)  # Reward for being upright, rescaled
+    action_cost = -0.1 * np.sum(np.square(action))  # Increased penalty for torque usage
+    angular_velocity_penalty = -0.5 * (theta_dot ** 2)  # Increased penalty for angular velocity
 
-    total = upright_reward + stability_penalty + action_cost
+    # Total reward
+    total = stability + action_cost + angular_velocity_penalty
 
     return {
         "total": total,
-        "upright_reward": upright_reward,
-        "stability_penalty": stability_penalty,
-        "action_cost": action_cost
+        "stability": stability,
+        "action_cost": action_cost,
+        "angular_velocity_penalty": angular_velocity_penalty
     }

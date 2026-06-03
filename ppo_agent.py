@@ -1,59 +1,74 @@
-from typing import Callable
+"""stable-baselines3 PPO wrapper for v2.
+
+By default the agent loads RL-Zoo3's tuned PPO hyperparameters for the env
+(learning rate, n_steps, batch_size, n_epochs, gamma, gae_lambda, clip_range,
+ent_coef, vf_coef, max_grad_norm, policy_kwargs, use_sde, ...), the number of
+parallel training envs (`n_envs`), and the VecNormalize setting.
+
+The training env stack is:  DummyVecEnv([CustomRewardWrapper(gym.make)]*n_envs)
+optionally wrapped in VecNormalize. CustomRewardWrapper sits *under* VecNormalize,
+so the composite reward function always sees RAW observations (correct for
+r_fixed and the BT model), while the policy sees normalized observations.
+
+Because the policy is trained on normalized observations, `predict` /
+`predict_deterministic` apply the same obs normalization (using the live
+VecNormalize stats) so trajectory collection and evaluation stay consistent. The
+VecNormalize stats are saved next to the policy so evaluate.py can reload them.
+"""
+
+from pathlib import Path
+from typing import Callable, Optional
 
 import gymnasium as gym
 import numpy as np
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-from env_setup import CustomRewardWrapper
-from reward import CompositeReward
-from reward_model import RewardModel
+from env_utils import CustomRewardWrapper
+from reward_fn import CompositeReward
+from zoo_hyperparams import load_zoo_ppo_hyperparams
 
 
 class PPOAgent:
-    """
-    Thin wrapper around stable-baselines3 PPO.
-
-    The training environment uses CustomRewardWrapper so PPO optimizes
-    alpha * r_fixed + (1 - alpha) * R_phi instead of the gym reward.
-    Evaluation runs on a raw gym env so it reports true environment reward.
-    """
-
     def __init__(
         self,
         env_id: str,
         reward_fn: Callable,
-        reward_model: RewardModel,
-        lr: float = 3e-4,
-        n_steps: int = 2_048,
-        batch_size: int = 64,
-        n_epochs: int = 10,
-        cache_key: str = "",
+        reward_model=None,
+        use_zoo_hyperparams: bool = True,
         progress_bar: bool = True,
         verbose: int = 0,
     ):
-        self._reward_fn = reward_fn
-        self._reward_model = reward_model
         self._env_id = env_id
-        self._cache_key = cache_key or env_id
         self._progress_bar = progress_bar
+        self._composite = CompositeReward(reward_fn, reward_model, alpha=1.0)
 
-        self._train_env = DummyVecEnv([self._make_train_env])
+        zoo = load_zoo_ppo_hyperparams(env_id) if use_zoo_hyperparams else {
+            "ppo_kwargs": {}, "n_envs": 1, "normalize": None, "found": False}
+        self.zoo = zoo
+        self._n_envs = max(1, int(zoo["n_envs"]))
+        self._norm_kwargs = zoo["normalize"]
+
+        venv = DummyVecEnv([self._make_train_env for _ in range(self._n_envs)])
+        if self._norm_kwargs is not None:
+            kw = dict(self._norm_kwargs)
+            kw.setdefault("gamma", zoo["ppo_kwargs"].get("gamma", 0.99))
+            venv = VecNormalize(venv, **kw)
+        self._train_env = venv
+        self._vecnorm: Optional[VecNormalize] = venv if isinstance(venv, VecNormalize) else None
+
+        ppo_kwargs = dict(zoo["ppo_kwargs"])
+        ppo_kwargs.setdefault("gamma", 0.99)
+        ppo_kwargs.setdefault("gae_lambda", 0.95)
         self._model = PPO(
-            "MlpPolicy",
-            self._train_env,
-            learning_rate=lr,
-            n_steps=n_steps,
-            batch_size=batch_size,
-            n_epochs=n_epochs,
-            gamma=0.99,
-            gae_lambda=0.95,
-            clip_range=0.2,
-            ent_coef=0.0,
-            device="cpu",
-            verbose=verbose,
+            "MlpPolicy", self._train_env,
+            device="cpu", verbose=verbose, **ppo_kwargs,
         )
 
+    def _make_train_env(self) -> CustomRewardWrapper:
+        return CustomRewardWrapper(gym.make(self._env_id), self._composite)
+
+    # ── training ─────────────────────────────────────────────
     def train(self, total_timesteps: int) -> None:
         self._model.learn(
             total_timesteps=total_timesteps,
@@ -61,50 +76,33 @@ class PPOAgent:
             progress_bar=self._progress_bar,
         )
 
+    def set_alpha(self, alpha: float) -> None:
+        self._composite.set_alpha(alpha)
+
+    def attach_reward_model(self, reward_model) -> None:
+        self._composite.set_reward_model(reward_model)
+
+    # ── inference (obs normalized to match training) ─────────
+    def _norm_obs(self, obs: np.ndarray) -> np.ndarray:
+        if self._vecnorm is not None:
+            return self._vecnorm.normalize_obs(obs)
+        return obs
+
     def predict(self, obs: np.ndarray) -> np.ndarray:
-        action, _ = self._model.predict(obs, deterministic=False)
+        action, _ = self._model.predict(self._norm_obs(obs), deterministic=False)
         return action
 
     def predict_deterministic(self, obs: np.ndarray) -> np.ndarray:
-        action, _ = self._model.predict(obs, deterministic=True)
+        action, _ = self._model.predict(self._norm_obs(obs), deterministic=True)
         return action
 
-    def evaluate(self, n_episodes: int = 5) -> float:
-        rewards = []
-        eval_env = gym.make(self._env_id)
-        try:
-            for _ in range(n_episodes):
-                obs, _ = eval_env.reset()
-                total, done = 0.0, False
-                while not done:
-                    action, _ = self._model.predict(obs, deterministic=True)
-                    obs, reward, terminated, truncated, _ = eval_env.step(action)
-                    total += float(reward)
-                    done = terminated or truncated
-                rewards.append(total)
-        finally:
-            eval_env.close()
-        return float(np.mean(rewards))
-
-    @property
-    def true_reward_history(self) -> list[float]:
-        histories = self._train_env.get_attr("true_reward_history")
-        return list(histories[0]) if histories else []
-
-    def set_alpha(self, alpha: float) -> None:
-        self._train_env.env_method("set_alpha", alpha)
-
+    # ── persistence ──────────────────────────────────────────
     def save(self, path: str) -> None:
-        self._model.save(path)
+        """Save policy.zip and, if used, the VecNormalize stats next to it."""
+        path = Path(path)
+        self._model.save(str(path))
+        if self._vecnorm is not None:
+            self._vecnorm.save(str(path.parent / "vecnormalize.pkl"))
 
     def load(self, path: str) -> None:
-        self._model = PPO.load(path, env=self._train_env)
-
-    def _make_train_env(self) -> CustomRewardWrapper:
-        env = gym.make(self._env_id)
-        composite = CompositeReward(
-            r_fixed=self._reward_fn,
-            cache_key=self._cache_key,
-            reward_model=self._reward_model,
-        )
-        return CustomRewardWrapper(env, composite)
+        self._model = PPO.load(path, env=self._train_env, device="cpu")

@@ -1,29 +1,29 @@
-def reward(obs, action, next_obs) -> dict:
-    forward_speed = next_obs[5]  # Reward for forward speed
-    height = obs[0]               # Torso height
-    torso_angle = obs[1]          # Torso angle
-    action_cost = -0.1 * float(np.sum(action ** 2))  # Penalty for large control torques
+def reward(obs, action, next_obs):
+    # Reward for forward speed
+    forward_speed = next_obs[5]  # x-axis velocity of the torso
+    forward_speed_reward = 5.0 * forward_speed  # Increase weight to encourage forward motion
 
-    # Normalize rewards with temperature
-    temp_forward = 10.0
-    temp_height = 5.0
-    temp_angle = 5.0
-    temp_action = 20.0
+    # Penalize large control torques (energy cost)
+    action_cost = -0.1 * float(np.sum(np.square(action)))  # Reduce penalty to allow more exploration
 
-    # Reward for staying upright and healthy
-    height_reward = 1.0 if height > 0.5 else 0.0  # Reward for being above a certain height
-    angle_reward = 1.0 if abs(torso_angle) < 0.2 else 0.0  # Reward for keeping torso angle small
+    # Stability and survival rewards
+    height = obs[0]  # z-position of the torso
+    torso_angle = obs[1]  # angle of the torso
+    stability = 0.0
 
-    # Total reward calculation with normalization
-    total = (np.exp(forward_speed / temp_forward) +
-             np.exp(height_reward / temp_height) +
-             np.exp(angle_reward / temp_angle) +
-             action_cost)
+    # Reward for staying upright (torso angle close to 0)
+    if -0.5 <= torso_angle <= 0.5:
+        stability += 1.0  # Increase reward for staying upright
 
+    # Penalize for being too low (height)
+    if height < 0.5:
+        stability -= 1.0  # Increase penalty for being too low
+
+    # Total reward calculation
+    total = forward_speed_reward + action_cost + stability
     return {
         "total": total,
-        "forward_speed": forward_speed,
+        "forward_speed_reward": forward_speed_reward,
         "action_cost": action_cost,
-        "height_reward": height_reward,
-        "angle_reward": angle_reward
+        "stability": stability
     }

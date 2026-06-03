@@ -1,326 +1,355 @@
-from dataclasses import dataclass, field
-from pathlib import Path
+"""Two-phase trainer for v2.
 
+Phase I  (k1 rounds): PPO optimizes the coded reward r_fixed only. After each
+round the LLM reflects on the training feedback and may rewrite r_fixed and the
+trajectory summarizer; the collected trajectories are relabelled under the new
+r_fixed, summarized, compared by the LLM, and used to train the Bradley-Terry
+reward model.
+
+Phase II (k2 rounds): PPO optimizes a fixed blend alpha*r_fixed + (1-alpha)*R_phi
+(no more reflection). Trajectories are still collected, compared, and used to
+keep training the BT model.
+
+Differences from v1 (deliberate): single BT network, full trajectories (no
+segments), uniform random pairs (no active learning), constant Phase-II alpha
+(no decay to 0), and the BEST-by-eval policy is saved (not the last).
+"""
+
+import json
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Callable, List, Optional, Tuple
+
+import numpy as np
 import gymnasium as gym
 
 from helper import load_task, section, success_fn_for_env
-from llm_utils import cache_key, generate_reward_fn, generate_semantic_fn
-from reward_model import RewardModel
+from llm import (
+    cache_key, generate_reward_fn, generate_semantic_fn,
+    compare_trajectories, reflect, exec_fn, strip_fences,
+)
+from reward_model import BTRewardModel, traj_to_sa
 from ppo_agent import PPOAgent
-from sampler import Sampler
-from llm_reflection import ReflectionEngine
-from paths import policy_dir, reward_model_dir, reflection_dir, metrics_path
+from env_utils import (
+    collect_trajectory, relabel_reward_components, eval_with_components,
+)
+from paths import (
+    policy_dir, reward_model_dir, reflection_dir, metrics_path,
+)
+
 
 @dataclass
 class TrainerConfig:
-    env_id: str             = "HalfCheetah-v4"
-    task_name: str          = "halfcheetah"
-    n_queries: int          = 10        # LLM queries per round
-    segment_length: int     = 50        # steps per trajectory segment
-    reward_epochs: int      = 50        # reward model training epochs per round
-    ppo_steps: int          = 20_000    # PPO timesteps per round
-    eval_every: int         = 1         # evaluate every N rounds
-    rounds: int             = 9
-    artifact_dir: str       = "artifacts"
-    progress_bar: bool      = True
-    llm_model: str          = "gpt-4o-mini"
-    verbose: bool           = True
-    lambda_smooth: float    = 1.0         # reward model temporal-smooth penalty
-    dynamic_batch: bool     = False       # use max(8,min(32,buffer//2)) vs min(10,buffer)
+    env_id: str        = "HalfCheetah-v4"
+    task_name: str     = "halfcheetah"
+    k1: int            = 5          # Phase I rounds
+    k2: int            = 5          # Phase II rounds
+    ppo_steps: int     = 100_000    # PPO timesteps per round (N)
+    num_trajs: int     = 10         # trajectories collected per round; all
+                                    # C(num_trajs, 2)=45 pairs are compared+trained
+                                    # on this round only (buffer reset each round)
+    reward_epochs: int = 50         # BT training epochs per round
+    alpha: float       = 0.5        # constant Phase-II mixing weight
+    eval_episodes: int = 100
+    reflect: bool      = True       # Phase-I reflection on/off
+    llm_model: str     = "gpt-4o-mini"
+    reflect_model: str = "gpt-4o"
+    artifact_dir: str  = "artifacts"
+    progress_bar: bool = True
+    verbose: bool      = True
 
-
-# ─────────────────────────────────────────────────────────────
-# Trainer
-# ─────────────────────────────────────────────────────────────
 
 class Trainer:
-
     def __init__(self, cfg: TrainerConfig):
         self.cfg = cfg
-
-        # ── task ────────────────────────────────────────────
         self.task = load_task(cfg.task_name)
 
         if cfg.verbose:
             print(section("Setup"))
             print(f"Env      : {cfg.env_id}")
             print(f"Task     : {cfg.task_name}")
-            print(f"Labeller : {cfg.llm_model}")
+            print(f"Phases   : I={cfg.k1} rounds (coded reward), "
+                  f"II={cfg.k2} rounds (alpha={cfg.alpha} blend)")
+            print(f"Labeller : {cfg.llm_model} | Reflector: {cfg.reflect_model}")
 
-        # ── LLM-generated components ────────────────────────
-        _probe_env = gym.make(cfg.env_id)
+        # ── LLM-generated reward + summarizer ────────────────
+        probe = gym.make(cfg.env_id)
         if cfg.verbose:
-            print(section("Generating reward fn + semantic layer"))
+            print(section("Generating coded reward + semantic summarizer"))
+        self.reward_code, self.reward_fn = generate_reward_fn(probe, self.task, cfg.llm_model)
+        self.semantic_code, self.semantic_fn = generate_semantic_fn(probe, self.task, cfg.llm_model)
+        self.cache_id = cache_key(probe, self.task)
+        probe.close()
 
-        reward_code, self.reward_fn   = generate_reward_fn(_probe_env, self.task, model=cfg.llm_model)
-        semantic_code, self.semantic_fn = generate_semantic_fn(_probe_env, self.task, model=cfg.llm_model)
-        self.cache_id = cache_key(_probe_env, self.task)
-        _probe_env.close()
+        # ── BT reward model ──────────────────────────────────
+        rm_env = gym.make(cfg.env_id)
+        self.reward_model = BTRewardModel(rm_env)
+        rm_env.close()
 
-        if cfg.verbose:
-            print("  ✓ cached for future runs")
-
-        # ── reward model ────────────────────────────────────
-        _env = gym.make(cfg.env_id)
-        self.reward_model = RewardModel(
-            env           = _env,
-            size_segment  = cfg.segment_length,
-            lambda_smooth = cfg.lambda_smooth,
-        )
-        _env.close()
-
-        # ── PPO agent ────────────────────────────────────────
+        # ── PPO agent (composite reward; reward_model attached) ──
         self.agent = PPOAgent(
-            env_id        = cfg.env_id,
-            reward_fn     = self.reward_fn,
-            reward_model  = self.reward_model,
-            cache_key     = self.cache_id,
-            progress_bar  = cfg.progress_bar,
-            verbose       = 0,
+            env_id=cfg.env_id,
+            reward_fn=self.reward_fn,
+            reward_model=self.reward_model,
+            progress_bar=cfg.progress_bar,
+            verbose=0,
         )
+        # keep the live composite in sync when r_fixed is hot-swapped
+        self._composite = self.agent._composite
 
-        # ── sampler ──────────────────────────────────────────
-        # sampler uses a separate env instance for trajectory collection
+        # ── env for collection / evaluation ──────────────────
         self._sample_env = gym.make(cfg.env_id)
-        self.sampler = Sampler(
-            env            = self._sample_env,
-            policy_fn      = self.agent.predict,
-            reward_model   = self.reward_model,
-            semantic_fn    = self.semantic_fn,
-            task           = self.task,
-            segment_length = cfg.segment_length,
-            llm_model      = cfg.llm_model,
-            verbose        = cfg.verbose,
-            reward_fn      = self.reward_fn,
-        )
 
-        # reflection is always on: after each eval the LLM may rewrite r_fixed
-        # and the trajectory summarizer based on the round-over-round dynamics.
-        composite = self.agent._train_env.envs[0]._reward_fn
-        self.reflection = ReflectionEngine(
-            task             = self.task,
-            reward_code      = reward_code,
-            semantic_code    = semantic_code,
-            composite_reward = composite,
-            sampler          = self.sampler,
-            reward_model     = self.reward_model,
-            llm_model        = cfg.llm_model,
-            verbose          = cfg.verbose,
-            output_dir       = reflection_dir(cfg.env_id, cfg.artifact_dir),
-        )
         # ── logging ──────────────────────────────────────────
-        # eval_rewards / reward_losses / ce_losses / smooth_losses /
-        # label_accuracies are kept as flat series for backward compatibility.
-        # eval_records / rm_records carry the richer per-round structure dumped
-        # to metrics.json for the plotting suite.
-        self.eval_rewards:     list[float] = []
-        self.reward_losses:    list[float] = []   # total = CE + λ*smooth
-        self.ce_losses:        list[float] = []   # CE only
-        self.smooth_losses:    list[float] = []   # smooth only (unscaled)
-        self.label_accuracies: list[float] = []
-        self.eval_records:     list[dict]  = []   # one per eval round
-        self.rm_records:       list[dict]  = []   # one per reward-model train step
-        self._current_alpha:   float       = 1.0
-        self.artifact_root = Path(cfg.artifact_dir)
+        self.round_records: List[dict] = []
+        self.snapshots: List[dict] = []        # for Phase-I reflection
+        self.reflection_log: List[dict] = []
+        self.best_return = -np.inf
+        self._global_round = 0
 
-    # ── public ───────────────────────────────────────────────
-
-    def run(self, n_rounds: int) -> None:
+    # ─────────────────────────────────────────────────────────
+    # Public
+    # ─────────────────────────────────────────────────────────
+    def run(self) -> None:
         if self.cfg.verbose:
-            print(section("Training"))
-            print(f"Rounds {n_rounds} | queries/round {self.cfg.n_queries} "
-                  f"| PPO steps/round {self.cfg.ppo_steps}")
+            print(section("Phase I — coded reward + reflection"))
+        for r in range(1, self.cfg.k1 + 1):
+            self._phase_round(phase="I", phase_round=r)
 
-        self._cold_start()
-
-        for rnd in range(1, n_rounds + 1):
-            if self.cfg.verbose:
-                print(section(f"Round {rnd}/{n_rounds}"))
-
-            alpha = self._alpha_for_round(rnd, n_rounds)
-            self._current_alpha = alpha
-            self._ppo_step(alpha)
-            self._label_step(use_active=True)
-            loss = self._reward_model_step(round_label=str(rnd))
-
-            if rnd % self.cfg.eval_every == 0:
-                self._eval_step(rnd, loss)
+        # entering Phase II: BT model now drives part of the reward
+        self.agent.attach_reward_model(self.reward_model)
+        self.agent.set_alpha(self.cfg.alpha)
+        if self.cfg.verbose:
+            print(section("Phase II — mixed reward (no reflection)"))
+        for r in range(1, self.cfg.k2 + 1):
+            self._phase_round(phase="II", phase_round=r)
 
         self._print_summary()
         self._save_artifacts()
 
-    # ── private: training steps ──────────────────────────────
-
-    def _cold_start(self) -> None:
-        """Uniform sampling before reward model is trained."""
+    # ─────────────────────────────────────────────────────────
+    # One round (shared structure for both phases)
+    # ─────────────────────────────────────────────────────────
+    def _phase_round(self, phase: str, phase_round: int) -> None:
+        self._global_round += 1
+        alpha = 1.0 if phase == "I" else self.cfg.alpha
         if self.cfg.verbose:
-            print(section("Cold start"))
-        self._label_step(use_active=False)
-        self._reward_model_step(round_label="cold")
+            print(section(f"Phase {phase} · round {phase_round} "
+                          f"(global {self._global_round}) · alpha {alpha:.2f}"))
 
-    def _alpha_for_round(self, rnd: int, n_rounds: int) -> float:
-        if n_rounds <= 1:
-            return 1.0
-        return 1.0 - ((rnd - 1) / (n_rounds - 1))
+        # 1. PPO with the current reward
+        if self.cfg.verbose:
+            print(f"  PPO | {self.cfg.ppo_steps} steps | alpha {alpha:.2f}")
+        self.agent.train(self.cfg.ppo_steps)
 
-    def _ppo_step(self, alpha: float) -> None:
-        if self.cfg.verbose:
-            print(f"  Training PPO policy | steps {self.cfg.ppo_steps} | alpha {alpha:.3f}")
-        self.agent.set_alpha(alpha)
-        self.agent.train(total_timesteps=self.cfg.ppo_steps)
-        if self.cfg.verbose:
-            print("  PPO policy training complete")
+        # 2. Evaluate on TRUE env reward (drives the per-round plot + reflection)
+        eval_data = self._evaluate()
+        self._record_eval(phase, alpha, eval_data)
 
-    def _label_step(self, use_active: bool) -> None:
-        added = self.sampler.collect_and_label(
-            n_queries=self.cfg.n_queries,
-            use_active=use_active,
-        )
-        if self.cfg.verbose:
-            print(f"  Labels added: {added} | buffer: {len(self.reward_model.buffer)}")
+        # 3. Collect trajectories with the current policy
+        trajs = self._collect(self.cfg.num_trajs)
 
-    def _reward_model_step(self, round_label: str = "") -> float:
-        n = len(self.reward_model.buffer)
-        if self.cfg.dynamic_batch:
-            batch_size = max(8, min(32, n // 2)) if n >= 2 else max(1, n)
-        else:
-            batch_size = min(10, n)
-        if self.cfg.verbose:
-            print(
-                f"  Training reward model | epochs {self.cfg.reward_epochs} "
-                f"| batch {batch_size} | labels {n}"
-            )
-        ce_loss, smooth_loss = self.reward_model.train(
-            batch_size=batch_size,
-            n_epochs=self.cfg.reward_epochs,
-            progress_bar=self.cfg.progress_bar,
-        )
-        total_loss = ce_loss + self.cfg.lambda_smooth * smooth_loss
+        # 4. Phase-I only: reflect → maybe rewrite r_fixed & summarizer
+        if phase == "I" and self.cfg.reflect:
+            self._reflect_step()
+            # 5. relabel reward components under the (possibly) new r_fixed
+            trajs = relabel_reward_components(trajs, self.reward_fn)
+
+        # 6. Semantic summaries + LLM comparisons → preference labels
+        added = self._label_and_store(trajs)
+
+        # 7. Bradley-Terry training
+        losses = self.reward_model.train(n_epochs=self.cfg.reward_epochs)
         acc = self.reward_model.accuracy()
-        self.reward_losses.append(total_loss)
-        self.ce_losses.append(ce_loss)
-        self.smooth_losses.append(smooth_loss)
-        self.label_accuracies.append(acc)
-        self.rm_records.append({
-            "round":   round_label,
-            "ce":      ce_loss,
-            "smooth":  smooth_loss,
-            "total":   total_loss,
-            "acc":     acc,
-            "n_labels": n,
+        self.round_records[-1].update({
+            "bt_loss_epochs": [float(x) for x in losses],
+            "bt_loss_mean": float(np.mean(losses)) if losses else 0.0,
+            "bt_acc": acc,
+            "n_labels": len(self.reward_model.buffer),
+            "labels_added": added,
         })
         if self.cfg.verbose:
-            print(
-                f"  Reward model | CE {ce_loss:.4f} | smooth {smooth_loss:.4f}"
-                f" | total {total_loss:.4f} | acc {acc:.2%}"
-            )
-        return total_loss
+            print(f"  BT model | epochs {self.cfg.reward_epochs} | "
+                  f"loss {np.mean(losses):.4f} | acc {acc:.2%} | "
+                  f"buffer {len(self.reward_model.buffer)}")
 
-    def _eval_step(self, rnd: int, loss: float) -> None:
-        if self.cfg.verbose:
-            print(section(f"Evaluation (round {rnd})"))
+    # ─────────────────────────────────────────────────────────
+    # Steps
+    # ─────────────────────────────────────────────────────────
+    def _collect(self, n: int) -> List[List[Tuple]]:
+        return [
+            collect_trajectory(self._sample_env, self.agent.predict, reward_fn=self.reward_fn)
+            for _ in range(n)
+        ]
 
-        # k-episode evaluation: full per-component breakdown + global metrics
-        import numpy as np
-        from env_setup import eval_with_components
+    def _make_pairs(self, n_trajs: int) -> List[Tuple[int, int]]:
+        """All unique unordered pairs — C(n_trajs, 2) comparisons."""
+        from itertools import combinations
+        return [(a, b) for a, b in combinations(range(n_trajs), 2)]
 
-        n_eval_episodes = 100
-        eval_data = eval_with_components(
-            self._sample_env,
-            self.agent.predict_deterministic,
-            self.reward_fn,
-            n_episodes=n_eval_episodes,
-        )
+    def _label_and_store(self, trajs: List[List[Tuple]]) -> int:
+        if len(trajs) < 2:
+            return 0
+        # Train the BT model on THIS round's trajectories only: the policy that
+        # rolled them out is different every round, so old pairs are off-policy.
+        self.reward_model.buffer.clear()
+        added = 0
+        for a, b in self._make_pairs(len(trajs)):
+            try:
+                label, expl = compare_trajectories(
+                    trajs[a], trajs[b], self.semantic_fn, self.task, self.cfg.llm_model)
+            except Exception as e:
+                if self.cfg.verbose:
+                    print(f"    [compare skipped] {type(e).__name__}: {e}")
+                continue
+            self.reward_model.add_pair(traj_to_sa(trajs[a]), traj_to_sa(trajs[b]), float(label))
+            added += 1
+            if self.cfg.verbose:
+                print(f"    LLM → {'A' if label == 1 else 'B'} | {expl[:70]}")
+        return added
+
+    def _evaluate(self) -> dict:
+        return eval_with_components(
+            self._sample_env, self.agent.predict_deterministic,
+            self.reward_fn, n_episodes=self.cfg.eval_episodes)
+
+    def _record_eval(self, phase: str, alpha: float, eval_data: dict) -> None:
         ep_rewards = [float(x) for x in eval_data["episode_env_rewards"]]
         ep_lengths = [int(x) for x in eval_data["episode_lengths"]]
         mean_r = float(np.mean(ep_rewards))
         mean_len = float(np.mean(ep_lengths))
-        # success rate: prefer env-reported is_success; else a per-env heuristic
-        # (e.g. InvertedPendulum survives the full horizon); else N/A.
-        sfn = success_fn_for_env(self.cfg.env_id)
-        successes = eval_data.get("success")
-        if sfn is not None:
-            success_rate = float(np.mean([
-                1.0 if sfn(l, r) else 0.0
-                for l, r in zip(eval_data["episode_lengths"],
-                                eval_data["episode_env_rewards"])
-            ]))
-        elif successes is not None:
-            success_rate = float(np.mean([1.0 if s else 0.0 for s in successes]))
-        else:
-            success_rate = None
-        component_sums = {
-            k: [float(x) for x in v]
-            for k, v in eval_data.get("component_sums", {}).items()
-        }
+        component_sums = {k: [float(x) for x in v]
+                          for k, v in eval_data.get("component_sums", {}).items()}
         component_means = {k: float(np.mean(v)) for k, v in component_sums.items()}
-        self.eval_rewards.append(mean_r)
-        self.eval_records.append({
-            "round":              rnd,
-            "alpha":              self._current_alpha,
-            "n_eval_episodes":    n_eval_episodes,
-            # aggregates (used by the default plots)
+
+        self.round_records.append({
+            "phase": phase,
+            "global_round": self._global_round,
+            "alpha": alpha,
             "episode_env_reward": mean_r,
             "episode_env_reward_std": float(np.std(ep_rewards)),
-            "episode_length":     mean_len,
-            "episode_length_std": float(np.std(ep_lengths)),
-            "success_rate":       success_rate,
-            "component_means":    component_means,
-            "loss":               loss,
-            "n_labels":           len(self.reward_model.buffer),
-            # raw per-episode data (for custom re-plotting: error bars, box plots…)
+            "episode_length": mean_len,
+            "component_means": component_means,
             "episode_env_rewards": ep_rewards,
-            "episode_lengths":     ep_lengths,
-            "component_sums":      component_sums,
-            "success":             eval_data.get("success"),
+        })
+        # snapshot for reflection (Phase I)
+        self.snapshots.append({
+            "component_means": component_means,
+            "episode_length": mean_len,
+            "episode_env_reward": mean_r,
         })
         if self.cfg.verbose:
-            print(f"  Env reward ({n_eval_episodes} ep mean): {mean_r:.1f} | length: {mean_len:.0f}")
+            print(f"  Eval | {self.cfg.eval_episodes} ep | return {mean_r:.1f} | "
+                  f"length {mean_len:.0f}")
 
-        if self.reflection is not None:
-            self.reflection.step(rnd, eval_data, loss, len(self.reward_model.buffer))
-            
-    # ── private: summary ─────────────────────────────────────
+        # save the BEST-by-eval policy (v1 saved the last, which collapsed)
+        if mean_r > self.best_return:
+            self.best_return = mean_r
+            pol = policy_dir(self.cfg.env_id, self.cfg.artifact_dir)
+            pol.mkdir(parents=True, exist_ok=True)
+            self.agent.save(str(pol / "policy"))
+            if self.cfg.verbose:
+                print(f"  ✓ new best policy ({mean_r:.1f}) saved")
 
+    # ── Phase-I reflection ───────────────────────────────────
+    def _reflect_step(self) -> None:
+        if self.cfg.verbose:
+            print("  [Reflection] calling LLM...")
+        try:
+            result = reflect(self.task, self.reward_code, self.semantic_code,
+                             self.snapshots, model=self.cfg.reflect_model)
+        except Exception as e:
+            print(f"  [reflection skipped] {type(e).__name__}: {e}")
+            return
+
+        reward_swapped = self._maybe_swap(result.get("reward_code"), "reward")
+        semantic_swapped = self._maybe_swap(result.get("semantic_code"), "summarize")
+        self.reflection_log.append({
+            "global_round": self._global_round,
+            "analysis": result.get("analysis"),
+            "reasoning": result.get("reasoning"),
+            "reward_swapped": reward_swapped,
+            "semantic_swapped": semantic_swapped,
+        })
+        rdir = reflection_dir(self.cfg.env_id, self.cfg.artifact_dir)
+        rdir.mkdir(parents=True, exist_ok=True)
+        (rdir / "reflection_log.json").write_text(json.dumps(self.reflection_log, indent=2))
+        if self.cfg.verbose:
+            print(f"  → reward_swapped={reward_swapped} semantic_swapped={semantic_swapped}")
+
+    def _maybe_swap(self, code: Optional[str], fn_name: str) -> bool:
+        if not code:
+            return False
+        code = strip_fences(code)
+        try:
+            fn = exec_fn(code, fn_name)
+            if not self._smoke_test(fn, fn_name):
+                return False
+        except Exception as e:
+            print(f"  Warning: {fn_name} compile/smoke failed ({e}); keeping current")
+            return False
+
+        rdir = reflection_dir(self.cfg.env_id, self.cfg.artifact_dir)
+        rdir.mkdir(parents=True, exist_ok=True)
+        if fn_name == "reward":
+            self.reward_fn = fn
+            self.reward_code = code
+            self._composite.r_fixed = fn        # live PPO env picks it up
+            (rdir / f"reward_round{self._global_round}.py").write_text(code)
+        else:
+            self.semantic_fn = fn
+            self.semantic_code = code
+            (rdir / f"semantic_round{self._global_round}.py").write_text(code)
+        return True
+
+    def _smoke_test(self, fn, fn_name: str) -> bool:
+        env = self._sample_env
+        obs = env.observation_space.sample()
+        action = env.action_space.sample()
+        try:
+            if fn_name == "reward":
+                out = fn(obs, action, obs)
+                vals = list(out.values()) if isinstance(out, dict) else [out]
+                return all(np.isfinite(float(v)) for v in vals)
+            else:
+                step = (obs, action, obs, {"total": 0.0, "dummy": 0.0}, False)
+                return isinstance(fn([step, step]), str)
+        except Exception as e:
+            print(f"  Warning: {fn_name} smoke test raised {type(e).__name__}: {e}")
+            return False
+
+    # ── summary + save ───────────────────────────────────────
     def _print_summary(self) -> None:
         if self.cfg.verbose:
             print(section("Summary"))
-        if self.eval_rewards:
-            print(f"  Final reward  : {self.eval_rewards[-1]:.1f}")
-            print(f"  Best reward   : {max(self.eval_rewards):.1f}")
-        if self.label_accuracies:
-            print(f"  LLM accuracy  : {self.label_accuracies[-1]:.1%}")
-        print(f"  Total labels  : {len(self.reward_model.buffer)}")
+        rets = [r["episode_env_reward"] for r in self.round_records]
+        if rets:
+            print(f"  Final round return : {rets[-1]:.1f}")
+            print(f"  Best  round return : {max(rets):.1f} (saved policy)")
+        print(f"  Buffer size        : {len(self.reward_model.buffer)}")
 
     def _save_artifacts(self) -> None:
-        import json
-        from dataclasses import asdict
-
-        reward_dir = reward_model_dir(self.cfg.env_id, self.cfg.artifact_dir)
-        pol_dir    = policy_dir(self.cfg.env_id, self.cfg.artifact_dir)
-        reward_dir.mkdir(parents=True, exist_ok=True)
-        pol_dir.mkdir(parents=True, exist_ok=True)
-
-        self.reward_model.save(str(reward_dir))
-        self.agent.save(str(pol_dir / "policy"))
+        rmdir = reward_model_dir(self.cfg.env_id, self.cfg.artifact_dir)
+        self.reward_model.save(str(rmdir))
+        # policy.zip already saved (best-by-eval) during training
 
         metrics = {
-            "env_id":         self.cfg.env_id,
-            "task":           self.cfg.task_name,
-            "config":         asdict(self.cfg),   # full run configuration
-            "rounds":         self.cfg.rounds,
-            "ppo_steps":      self.cfg.ppo_steps,
-            "lambda_smooth":  self.cfg.lambda_smooth,
-            "eval":           self.eval_records,    # per eval round (+ raw per-episode arrays)
-            "reward_model":   self.rm_records,      # per reward-model train step
-            "buffer_size":    len(self.reward_model.buffer),
+            "env_id": self.cfg.env_id,
+            "task": self.cfg.task_name,
+            "config": asdict(self.cfg),
+            "k1": self.cfg.k1,
+            "k2": self.cfg.k2,
+            "alpha": self.cfg.alpha,
+            "reward_epochs": self.cfg.reward_epochs,
+            "rounds": self.round_records,
+            "buffer_size": len(self.reward_model.buffer),
+            "best_return": float(self.best_return),
         }
         mpath = metrics_path(self.cfg.env_id, self.cfg.artifact_dir)
         mpath.parent.mkdir(parents=True, exist_ok=True)
         mpath.write_text(json.dumps(metrics, indent=2))
-
         if self.cfg.verbose:
             print(section("Artifacts"))
-            print(f"  Reward model: {reward_dir}")
-            print(f"  Policy      : {pol_dir / 'policy.zip'}")
-            print(f"  Metrics     : {mpath}")
+            print(f"  Reward model : {rmdir}")
+            print(f"  Policy       : {policy_dir(self.cfg.env_id, self.cfg.artifact_dir) / 'policy.zip'}")
+            print(f"  Metrics      : {mpath}")

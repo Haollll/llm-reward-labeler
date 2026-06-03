@@ -1,1 +1,0 @@
-/root/anaconda3/envs/llm-reward/bin/python -m rl_zoo3.train --algo ppo --env Hopper-v4 --log-folder baselines --seed 1

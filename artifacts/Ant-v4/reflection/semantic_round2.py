@@ -1,42 +1,41 @@
 def summarize(trajectory):
     import numpy as np
-
-    obs = np.array([t[0] for t in trajectory])
-    actions = np.array([t[1] for t in trajectory])
-    next_obs = np.array([t[2] for t in trajectory])
     
-    # Extract relevant observations
-    torso_heights = obs[:, 0]
-    forward_velocities = next_obs[:, 13]
-    lateral_velocities = next_obs[:, 14]
-    angular_velocities = obs[:, 16:19]
-    joint_angles = obs[:, 5:13]
-    joint_velocities = obs[:, 19:27]
+    episode_length = len(trajectory)
+    if episode_length == 0:
+        return "No data available for summary."
     
-    # Calculate behavioral features
-    mean_height = np.mean(torso_heights)
-    std_height = np.std(torso_heights)
-    mean_forward_velocity = np.mean(forward_velocities)
-    max_forward_velocity = np.max(forward_velocities)
-    mean_lateral_velocity = np.mean(np.abs(lateral_velocities))
-    mean_joint_angles = np.mean(joint_angles, axis=0)
-    mean_joint_velocities = np.mean(joint_velocities, axis=0)
+    heights = np.array([obs[0] for obs, action, next_obs, r_comp, done in trajectory])
+    forward_velocities = np.array([next_obs[13] for obs, action, next_obs, r_comp, done in trajectory])
+    lateral_velocities = np.array([next_obs[14] for obs, action, next_obs, r_comp, done in trajectory])
+    actions = np.array([action for obs, action, next_obs, r_comp, done in trajectory])
+    
+    height_mean = np.mean(heights)
+    height_std = np.std(heights)
+    forward_velocity_mean = np.mean(forward_velocities)
+    forward_velocity_std = np.std(forward_velocities)
+    lateral_velocity_mean = np.mean(np.abs(lateral_velocities))
+    lateral_velocity_std = np.std(np.abs(lateral_velocities))
+    energy_expended = np.sum(np.abs(actions))
+    
+    healthy_steps = np.sum((heights > 0.3) & (heights < 0.8))  # Adjusted healthy height range
+    health_ratio = healthy_steps / episode_length
     
     summary = (
-        f"Average torso height: {mean_height:.2f} (std: {std_height:.2f}). "
-        f"Average forward velocity: {mean_forward_velocity:.2f} (max: {max_forward_velocity:.2f}). "
-        f"Average lateral velocity: {mean_lateral_velocity:.2f}. "
-        f"Mean joint angles: {mean_joint_angles}. "
-        f"Mean joint velocities: {mean_joint_velocities}."
+        f"Episode length: {episode_length}\n"
+        f"Average height: {height_mean:.2f} (std: {height_std:.2f})\n"
+        f"Average forward velocity: {forward_velocity_mean:.2f} (std: {forward_velocity_std:.2f})\n"
+        f"Average lateral velocity: {lateral_velocity_mean:.2f} (std: {lateral_velocity_std:.2f})\n"
+        f"Total energy expended: {energy_expended:.2f}\n"
+        f"Healthy steps ratio: {health_ratio:.2f}"
     )
     
-    # Reward breakdown
-    r_comp = trajectory[0][3]  # Assuming r_comp is the same for all steps
+    r_comp = trajectory[0][3]  # Get reward components from the first entry
     for k in r_comp:
         if k == "total":
             continue
-        per_step_mean = np.mean([t[3][k] for t in trajectory])
-        trajectory_sum = np.sum([t[3][k] for t in trajectory])
-        summary += f" Mean {k}: {per_step_mean:.2f}, Total {k}: {trajectory_sum:.2f}."
+        per_step_mean = np.mean([r_comp[k] for obs, action, next_obs, r_comp, done in trajectory])
+        trajectory_sum = np.sum([r_comp[k] for obs, action, next_obs, r_comp, done in trajectory])
+        summary += f"\nMean {k}: {per_step_mean:.2f}, Sum {k}: {trajectory_sum:.2f}"
     
-    return summary.strip()
+    return summary

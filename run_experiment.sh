@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# Full experiment pipeline:
-#   1. Train the LLM-reward pipeline on all envs
-#   2. Train the RL-Zoo3 PPO baselines
-#   3. Evaluate pipeline vs baseline per env (writes eval.json + comparison PDF)
-#   4. Generate the plot suite (per-env + cross-env)
+# Full v2 experiment pipeline:
+#   1. Train the two-phase LLM-reward pipeline on all envs
+#   2. Evaluate pipeline vs RL-Zoo3 baseline per env (writes eval.json,
+#      baseline/metrics.json, bt_vs_env.json)
+#   3. Generate the plot suite per env
 #
-# Usage:
-#   ./run_experiment.sh
+# Baselines are reused from the v1 project via the `baselines/` symlink — no
+# baseline retraining here. If the symlink is missing, train baselines with
+# rl_zoo3 first (see the v1 train_baselines.py).
 #
-# Notes:
-#   - PPO steps/round is auto-set per env to (rl-zoo3 total timesteps)/(rounds+1).
-#   - This is a long, API-billed run (LLM preference labels + reflection per round).
+# Usage:  ./run_experiment.sh
 
 set -euo pipefail
 
 ENVS=(Pendulum-v1 Swimmer-v4 HalfCheetah-v4 Hopper-v4 Walker2d-v4 Ant-v4)
 
-PIPELINE_FLAGS=(--rounds 9 --queries 25 --reward-epochs 50 --lambda-smooth 0.05 --dynamic-batch)
+# Phase I = 5 rounds (coded reward + reflection), Phase II = 5 rounds (alpha blend)
+TRAIN_FLAGS=(--k1 5 --k2 5 --ppo-steps 100000 --num-trajs 10 \
+             --reward-epochs 50 --alpha 0.5 --eval-episodes 100 --no-progress-bar)
 
-# Mirror all terminal output (stdout + stderr) to a timestamped log file.
 LOG_DIR="logs"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/experiment_$(date +%Y%m%d_%H%M%S).log"
@@ -26,29 +26,23 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 echo "Logging all output to: $LOG_FILE"
 
 echo "=============================================================="
-echo " 1/4  Training LLM-reward pipeline on: ${ENVS[*]}"
+echo " 1/3  Training v2 pipeline on: ${ENVS[*]}"
 echo "=============================================================="
-python train_all.py --envs "${ENVS[@]}" "${PIPELINE_FLAGS[@]}"
+python train_all.py --envs "${ENVS[@]}" "${TRAIN_FLAGS[@]}"
 
 echo "=============================================================="
-echo " 2/4  Training RL-Zoo3 PPO baselines"
-echo "=============================================================="
-python train_baselines.py --envs "${ENVS[@]}"
-
-echo "=============================================================="
-echo " 3/4  Evaluating pipeline vs baseline (per env)"
+echo " 2/3  Evaluating pipeline vs baseline (per env)"
 echo "=============================================================="
 for ENV in "${ENVS[@]}"; do
     echo "----- evaluate $ENV -----"
-    python evaluate.py --env "$ENV"
+    python evaluate.py --env "$ENV" --episodes 100
 done
 
 echo "=============================================================="
-echo " 4/4  Generating plots"
+echo " 3/3  Generating plots"
 echo "=============================================================="
 python make_plots.py --env "${ENVS[@]}"
-python make_plots.py --cross-env "${ENVS[@]}"
 
 echo "=============================================================="
-echo " Done. Artifacts in artifacts/<env>/ and artifacts/cross_env/"
+echo " Done. Artifacts in artifacts/<env>/ (plots under artifacts/<env>/plots/)"
 echo "=============================================================="

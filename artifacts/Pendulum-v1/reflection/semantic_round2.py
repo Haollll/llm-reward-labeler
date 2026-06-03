@@ -3,34 +3,39 @@ def summarize(trajectory):
     
     obs = np.array([t[0] for t in trajectory])
     actions = np.array([t[1] for t in trajectory])
-    next_obs = np.array([t[2] for t in trajectory])
+    rewards = np.array([t[3] for t in trajectory])
     
+    # Calculate behavioral features
     cos_theta = obs[:, 0]
     sin_theta = obs[:, 1]
     angular_velocity = obs[:, 2]
     
     mean_cos_theta = np.mean(cos_theta)
-    std_cos_theta = np.std(cos_theta)
     mean_sin_theta = np.mean(sin_theta)
-    std_sin_theta = np.std(sin_theta)
     mean_angular_velocity = np.mean(angular_velocity)
-    std_angular_velocity = np.std(angular_velocity)
+    max_cos_theta = np.max(cos_theta)
+    min_cos_theta = np.min(cos_theta)
+    torque_used = np.sum(np.square(actions))
     
-    mean_action = np.mean(actions)
-    std_action = np.std(actions)
+    episode_length = len(trajectory)
     
-    summary = []
-    summary.append(f"Mean cos(theta): {mean_cos_theta:.4f}, Std cos(theta): {std_cos_theta:.4f}")
-    summary.append(f"Mean sin(theta): {mean_sin_theta:.4f}, Std sin(theta): {std_sin_theta:.4f}")
-    summary.append(f"Mean angular velocity: {mean_angular_velocity:.4f}, Std angular velocity: {std_angular_velocity:.4f}")
-    summary.append(f"Mean torque applied: {mean_action:.4f}, Std torque: {std_action:.4f}")
+    summary = (
+        f"Mean cos(theta): {mean_cos_theta:.4f}\n"
+        f"Mean sin(theta): {mean_sin_theta:.4f}\n"
+        f"Mean angular velocity: {mean_angular_velocity:.4f}\n"
+        f"Max cos(theta): {max_cos_theta:.4f}\n"
+        f"Min cos(theta): {min_cos_theta:.4f}\n"
+        f"Torque used (energy expended): {torque_used:.4f}\n"
+        f"Episode length: {episode_length}\n"
+    )
     
-    for k in trajectory[0][3]:  # r_comp is in the 4th element of the tuple
+    # Reward breakdown
+    r_comp = trajectory[0][3]  # Assuming r_comp is the same for all steps
+    for k in r_comp:
         if k == "total":
             continue
-        component_values = np.array([t[3][k] for t in trajectory])
-        mean_component = np.mean(component_values)
-        sum_component = np.sum(component_values)
-        summary.append(f"Mean {k}: {mean_component:.4f}, Sum {k}: {sum_component:.4f}")
+        mean_reward = np.mean([t[3][k] for t in trajectory])
+        sum_reward = np.sum([t[3][k] for t in trajectory])
+        summary += f"Mean {k}: {mean_reward:.4f}, Sum {k}: {sum_reward:.4f}\n"
     
-    return "\n".join(summary)
+    return summary.strip()

@@ -1,14 +1,15 @@
-"""Env-first artifact layout.
+"""Env-first artifact layout for v2.
 
-Everything an env produces lives under a single directory so multi-env runs stay
-organized and a whole env can be archived or deleted in one move:
+Everything an env produces lives under a single directory:
 
     artifacts/<env_id>/
-        policies/policy.zip
-        reward_models/{member*.pt, metadata.pt}
-        baseline/metrics.json          # RL-Zoo3 baseline returns/lengths
+        policies/policy.zip            # trained PPO policy
+        reward_model/{model.pt, meta.pt}
+        baseline/metrics.json          # RL-Zoo3 baseline returns/lengths (cached)
         reflection/{reflection_log.json, reward_round<r>.py, semantic_round<r>.py}
-        metrics.json                   # per-round training metrics (for plots)
+        metrics.json                   # per-round training metrics (drives plots)
+        eval.json                      # trained-policy evaluation (100 ep)
+        bt_vs_env.json                 # per-step BT reward vs true env reward (1 ep)
         plots/*.pdf
 """
 
@@ -24,7 +25,7 @@ def policy_dir(env_id: str, artifact_dir: str = "artifacts") -> Path:
 
 
 def reward_model_dir(env_id: str, artifact_dir: str = "artifacts") -> Path:
-    return env_dir(env_id, artifact_dir) / "reward_models"
+    return env_dir(env_id, artifact_dir) / "reward_model"
 
 
 def baseline_dir(env_id: str, artifact_dir: str = "artifacts") -> Path:
@@ -44,8 +45,11 @@ def metrics_path(env_id: str, artifact_dir: str = "artifacts") -> Path:
 
 
 def eval_metrics_path(env_id: str, artifact_dir: str = "artifacts") -> Path:
-    """evaluate.py's pipeline-policy evaluation results (drives the cross-env plot)."""
     return env_dir(env_id, artifact_dir) / "eval.json"
+
+
+def bt_vs_env_path(env_id: str, artifact_dir: str = "artifacts") -> Path:
+    return env_dir(env_id, artifact_dir) / "bt_vs_env.json"
 
 
 def baseline_metrics_path(env_id: str, artifact_dir: str = "artifacts") -> Path:

@@ -1,31 +1,25 @@
-def reward(obs, action, next_obs) -> dict:
+def reward(obs, action, next_obs):
+    forward_speed = next_obs[8]  # Reward for forward speed
+    action_cost = -0.05 * float(np.sum(np.square(action)))  # Increase effort penalty
+    
+    # Stability and survival terms
     height = obs[0]
     torso_angle = obs[1]
-    forward_velocity = next_obs[8]
-
-    # Reward for moving forward
-    progress = forward_velocity
-
-    # Survival bonus for staying upright and healthy
-    height_bonus = 1.0 if 0.7 < height < 2.0 else -1.0
-    angle_bonus = 1.0 if -0.2 < torso_angle < 0.2 else -1.0
-    survival_bonus = height_bonus + angle_bonus
-
-    # Penalty for large control torques (energy)
-    action_cost_temp = 5.0  # Temperature for action cost
-    action_cost = -np.clip(np.exp(-np.sum(action ** 2) / action_cost_temp), 0, 1)
-
-    # Normalize progress and survival bonuses to a comparable range
-    progress_temp = 10.0  # Temperature for progress
-    normalized_progress = np.clip(np.exp(forward_velocity / progress_temp), 0, 1)
-    normalized_survival_bonus = np.clip(survival_bonus, -2, 2)  # Scale survival bonus to [-2, 2]
-
-    # Total reward calculation
-    total = normalized_progress + normalized_survival_bonus + action_cost
-
+    
+    # Reward for staying upright and healthy
+    stability = 0.0
+    if height > 0.7:  # Further increase healthy height threshold
+        stability += 1.0
+    stability += np.exp(-np.clip(np.abs(torso_angle), 0, 0.5))  # Penalize large angles more
+    
+    # Increase survival bonus to encourage longer episodes
+    survival_bonus = 1.0
+    
+    total = forward_speed + action_cost + stability + survival_bonus
     return {
         "total": total,
-        "progress": normalized_progress,
-        "survival_bonus": normalized_survival_bonus,
-        "action_cost": action_cost
+        "forward_speed": forward_speed,
+        "action_cost": action_cost,
+        "stability": stability,
+        "survival_bonus": survival_bonus
     }
